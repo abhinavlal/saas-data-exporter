@@ -1,0 +1,35 @@
+# Environment and secrets
+.env
+*.json.key
+service-account.json
+
+# Input CSV files (contain real data)
+github_repos.csv
+jira_projects.csv
+slack_channels.csv
+google_users.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
