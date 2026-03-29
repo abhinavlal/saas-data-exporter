@@ -6,7 +6,7 @@ import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store
+from lib.s3 import S3Store, NDJSONWriter
 from lib.checkpoint import CheckpointManager
 from lib.session import make_session
 from lib.logging import setup_logging
@@ -65,8 +65,16 @@ class SlackExporter:
         self.session.headers["Authorization"] = f"Bearer {token}"
 
     def run(self):
+        failed = []
         for channel_id in self.channel_ids:
-            self._export_channel(channel_id)
+            try:
+                self._export_channel(channel_id)
+            except Exception:
+                log.error("Export failed for channel %s, continuing with next", channel_id, exc_info=True)
+                failed.append(channel_id)
+        if failed:
+            log.error("Failed channels (%d/%d): %s",
+                      len(failed), len(self.channel_ids), ", ".join(failed))
 
     def _export_channel(self, channel_id: str):
         log.info("Starting Slack export for channel %s", channel_id)
@@ -78,29 +86,38 @@ class SlackExporter:
         if not checkpoint.is_phase_done("channel_info"):
             self._fetch_and_upload_channel_info(channel_id, s3_base, checkpoint)
 
-        # Step 2: messages
+        # Step 2: messages (saves to S3 when done)
         if not checkpoint.is_phase_done("messages"):
-            messages = self._fetch_messages(channel_id, checkpoint)
-        else:
-            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
+            self._fetch_messages(channel_id, checkpoint)
 
-        # Step 3: thread replies
+        # Step 3: thread replies — reload from S3 to avoid holding messages
+        # across phases
         if self.include_threads and not checkpoint.is_phase_done("threads"):
+            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
             messages = self._fetch_thread_replies(channel_id, messages, checkpoint)
+            messages.sort(key=lambda m: _safe_ts(m))
+            self.s3.upload_json(messages, f"{s3_base}/messages.json")
+            del messages
 
-        # Step 4: sort chronologically and save
-        messages.sort(key=lambda m: _safe_ts(m))
-        self.s3.upload_json(messages, f"{s3_base}/messages.json")
-
-        # Step 5: download attachments
+        # Step 4: download attachments — reload from S3
         if not self.skip_attachments and not checkpoint.is_phase_done("attachments"):
+            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
             self._download_attachments(messages, channel_id, s3_base, checkpoint)
             # Re-save messages with _local_file references added
             messages.sort(key=lambda m: _safe_ts(m))
             self.s3.upload_json(messages, f"{s3_base}/messages.json")
+            msg_count = len(messages)
+            del messages
+        else:
+            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
+            # Ensure final sort even if no threads/attachments phase ran
+            messages.sort(key=lambda m: _safe_ts(m))
+            self.s3.upload_json(messages, f"{s3_base}/messages.json")
+            msg_count = len(messages)
+            del messages
 
         checkpoint.complete()
-        log.info("Slack export complete for channel %s (%d messages)", channel_id, len(messages))
+        log.info("Slack export complete for channel %s (%d messages)", channel_id, msg_count)
 
     # ── Channel Info ──────────────────────────────────────────────────────
 
@@ -123,42 +140,48 @@ class SlackExporter:
 
     # ── Messages ──────────────────────────────────────────────────────────
 
-    def _fetch_messages(self, channel_id: str, checkpoint: CheckpointManager) -> list[dict]:
+    def _fetch_messages(self, channel_id: str, checkpoint: CheckpointManager) -> None:
+        """Fetch all messages and save to S3. Memory is released after save."""
         checkpoint.start_phase("messages")
-        messages = []
+        s3_base = f"slack/{channel_id}"
+        writer = NDJSONWriter(self.s3, f"{s3_base}/_messages_wip.json")
         cursor = checkpoint.get_cursor("messages")
         params = {"channel": channel_id, "limit": 200}
         if cursor:
             params["cursor"] = cursor
 
-        while True:
-            resp = self.session.get(f"{SLACK_API}/conversations.history", params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        try:
+            while True:
+                resp = self.session.get(f"{SLACK_API}/conversations.history", params=params)
+                resp.raise_for_status()
+                data = resp.json()
 
-            if not data.get("ok"):
-                log.error("conversations.history failed: %s", data.get("error"))
-                break
+                if not data.get("ok"):
+                    log.error("conversations.history failed: %s", data.get("error"))
+                    break
 
-            for msg in data.get("messages", []):
-                messages.append(msg)
-                checkpoint.mark_item_done("messages", msg.get("ts"))
+                for msg in data.get("messages", []):
+                    writer.append(msg)
+                    checkpoint.mark_item_done("messages", msg.get("ts"))
 
-            next_cursor = data.get("response_metadata", {}).get("next_cursor")
-            checkpoint.set_cursor("messages", next_cursor)
-            checkpoint.save()
+                next_cursor = data.get("response_metadata", {}).get("next_cursor")
+                checkpoint.set_cursor("messages", next_cursor)
+                checkpoint.save()
 
-            if not next_cursor:
-                break
-            params["cursor"] = next_cursor
+                if not next_cursor:
+                    break
+                params["cursor"] = next_cursor
 
-        # Save intermediate
-        s3_base = f"slack/{channel_id}"
+            # Read back from disk, upload final JSON array
+            messages = writer.read_all()
+        finally:
+            writer.close()
+
         self.s3.upload_json(messages, f"{s3_base}/messages.json")
+        log.info("Fetched %d messages from %s", len(messages), channel_id)
+        del messages
         checkpoint.complete_phase("messages")
         checkpoint.save(force=True)
-        log.info("Fetched %d messages from %s", len(messages), channel_id)
-        return messages
 
     # ── Thread Replies ────────────────────────────────────────────────────
 

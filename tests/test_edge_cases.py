@@ -62,7 +62,7 @@ class TestEmptyExports:
 
         exporter = GitHubExporter(
             token="fake", repo="owner/empty", s3=store, config=config,
-            commit_limit=10, pr_limit=10,
+            commit_limit=10, pr_limit=10, skip_commits=False,
         )
         exporter.run()
 
@@ -221,6 +221,15 @@ class TestCheckpointOnError:
         store, config, _ = s3_env
         from exporters.github import GitHubExporter
 
+        def _commit_obj(sha):
+            return {
+                "sha": sha,
+                "commit": {"message": "ok", "author": {"name": "A", "email": "a@b.com", "date": "2024-01-01T00:00:00Z"},
+                           "committer": {"name": "A", "email": "a@b.com", "date": "2024-01-01T00:00:00Z"}},
+                "author": {"login": "a"}, "committer": {"login": "a"},
+                "parents": [], "html_url": "...",
+            }
+
         # Metadata
         responses.add(responses.GET, "https://api.github.com/repos/owner/repo",
                        json={"full_name": "owner/repo", "topics": []}, status=200)
@@ -231,20 +240,14 @@ class TestCheckpointOnError:
                        json=[], status=200)
         # Commit list
         responses.add(responses.GET, "https://api.github.com/repos/owner/repo/commits",
-                       json=[{"sha": "sha1"}, {"sha": "sha2"}], status=200)
+                       json=[_commit_obj("sha1"), _commit_obj("sha2")], status=200)
         responses.add(responses.GET, "https://api.github.com/repos/owner/repo/commits",
                        json=[], status=200)
-        # sha1 succeeds
+        # Detail endpoints (for commit_details=True)
         responses.add(responses.GET, "https://api.github.com/repos/owner/repo/commits/sha1",
-                       json={
-                           "sha": "sha1",
-                           "commit": {"message": "ok", "author": {"name": "A", "email": "a@b.com", "date": "2024-01-01T00:00:00Z"},
-                                      "committer": {"name": "A", "email": "a@b.com", "date": "2024-01-01T00:00:00Z"}},
-                           "author": {"login": "a"}, "committer": {"login": "a"},
-                           "parents": [], "stats": {"additions": 1, "deletions": 0, "total": 1},
-                           "files": [], "html_url": "...",
-                       }, status=200)
-        # sha2 fails with 404 (individual item failure, should not crash)
+                       json={**_commit_obj("sha1"), "stats": {"additions": 1, "deletions": 0, "total": 1}, "files": []},
+                       status=200)
+        # sha2 fails with 404
         responses.add(responses.GET, "https://api.github.com/repos/owner/repo/commits/sha2",
                        json={"message": "Not Found"}, status=404)
         # Empty PRs
@@ -253,7 +256,7 @@ class TestCheckpointOnError:
 
         exporter = GitHubExporter(
             token="fake", repo="owner/repo", s3=store, config=config,
-            commit_limit=10, pr_limit=10,
+            commit_limit=10, pr_limit=10, skip_commits=False, commit_details=True,
         )
         exporter.run()
 
@@ -366,3 +369,57 @@ class TestCsvEdgeCases:
         resp = conn.get_object(Bucket="test-bucket", Key="github/o__r/pull_requests.csv")
         csv_bytes = resp["Body"].read()
         assert csv_bytes == b""  # empty CSV for no PRs
+
+
+class TestPerTargetErrorHandling:
+    """One bad target should not kill the entire exporter."""
+
+    @responses.activate
+    def test_jira_continues_after_project_failure(self, s3_env):
+        """If one Jira project fails, the next should still be exported."""
+        store, config, _ = s3_env
+        from exporters.jira import JiraExporter
+
+        responses.add(responses.GET, "https://test.atlassian.net/rest/api/3/field",
+                       json=[], status=200)
+        # FAIL project: search returns 500
+        responses.add(responses.POST, "https://test.atlassian.net/rest/api/3/search/jql",
+                       json={"error": "Internal error"}, status=500)
+        # OK project: search returns empty
+        responses.add(responses.POST, "https://test.atlassian.net/rest/api/3/search/jql",
+                       json={"issues": [], "nextPageToken": None}, status=200)
+
+        exporter = JiraExporter(
+            token="fake", email="test@test.com", domain="test.atlassian.net",
+            projects=["FAIL", "OK"], s3=store, config=config, limit=10,
+        )
+        exporter.run()  # Should not raise
+
+        # The OK project should still have been exported
+        tickets = store.download_json("jira/OK/tickets.json")
+        assert tickets == []
+
+    @responses.activate
+    def test_slack_continues_after_channel_failure(self, s3_env):
+        """If one Slack channel fails, the next should still be exported."""
+        store, config, _ = s3_env
+        from exporters.slack import SlackExporter
+
+        # FAIL channel: info returns error
+        responses.add(responses.GET, "https://slack.com/api/conversations.info",
+                       json={"ok": False, "error": "channel_not_found"}, status=200)
+        responses.add(responses.GET, "https://slack.com/api/conversations.history",
+                       body="server error", status=500)
+        # OK channel
+        responses.add(responses.GET, "https://slack.com/api/conversations.info",
+                       json={"ok": True, "channel": {"id": "COK", "name": "ok"}}, status=200)
+        responses.add(responses.GET, "https://slack.com/api/conversations.history",
+                       json={"ok": True, "messages": []}, status=200)
+
+        exporter = SlackExporter(
+            token="xoxb-fake", channel_ids=["CFAIL", "COK"], s3=store, config=config,
+        )
+        exporter.run()  # Should not raise
+
+        messages = store.download_json("slack/COK/messages.json")
+        assert messages == []

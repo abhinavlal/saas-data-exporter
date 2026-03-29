@@ -7,7 +7,7 @@ import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store
+from lib.s3 import S3Store, NDJSONWriter
 from lib.checkpoint import CheckpointManager
 from lib.session import make_session
 from lib.logging import setup_logging
@@ -60,7 +60,7 @@ class JiraExporter:
         projects: list[str],
         s3: S3Store,
         config: ExportConfig,
-        limit: int = 100,
+        limit: int = 0,
         skip_attachments: bool = False,
         skip_comments: bool = False,
     ):
@@ -83,8 +83,16 @@ class JiraExporter:
         self._field_map: dict[str, str] | None = None
 
     def run(self):
+        failed = []
         for project in self.projects:
-            self._export_project(project)
+            try:
+                self._export_project(project)
+            except Exception:
+                log.error("Export failed for project %s, continuing with next", project, exc_info=True)
+                failed.append(project)
+        if failed:
+            log.error("Failed projects (%d/%d): %s",
+                      len(failed), len(self.projects), ", ".join(failed))
 
     def _export_project(self, project_key: str):
         log.info("Starting Jira export for project %s", project_key)
@@ -96,17 +104,16 @@ class JiraExporter:
         if self._field_map is None:
             self._field_map = self._resolve_custom_fields()
 
-        # Step 1: search tickets
+        # Step 1: search tickets (saves intermediate results to S3)
         if not checkpoint.is_phase_done("tickets"):
-            tickets = self._search_tickets(project_key, checkpoint)
+            self._search_tickets(project_key, checkpoint)
             checkpoint.complete_phase("tickets")
             checkpoint.save(force=True)
-        else:
-            # Load tickets from S3 for comment/attachment phases
-            tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
 
-        # Step 2: fetch comments
+        # Step 2: fetch comments — reload tickets from S3 to avoid holding
+        # the full search-phase list in memory across phases
         if not self.skip_comments and not checkpoint.is_phase_done("comments"):
+            tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
             checkpoint.start_phase("comments", total=len(tickets))
             for ticket in tickets:
                 key = ticket["key"]
@@ -115,64 +122,82 @@ class JiraExporter:
                 ticket["comments"] = self._fetch_comments(key)
                 checkpoint.mark_item_done("comments", key)
                 checkpoint.save()
+            # Save enriched tickets and release memory
+            self.s3.upload_json(tickets, f"{s3_base}/tickets.json")
+            del tickets
             checkpoint.complete_phase("comments")
             checkpoint.save(force=True)
 
-        # Step 3: download attachments
+        # Step 3: download attachments — reload from S3
         if not self.skip_attachments and not checkpoint.is_phase_done("attachments"):
+            tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
             checkpoint.start_phase("attachments")
             self._download_all_attachments(tickets, project_key, s3_base, checkpoint)
+            del tickets
             checkpoint.complete_phase("attachments")
             checkpoint.save(force=True)
 
-        # Step 4: upload final results
-        self.s3.upload_json(tickets, f"{s3_base}/tickets.json")
+        # Step 4: upload final CSV (tickets.json is already up-to-date)
+        tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
         self._upload_csv(tickets, s3_base)
+        ticket_count = len(tickets)
+        del tickets
         checkpoint.complete()
-        log.info("Jira export complete for %s (%d tickets)", project_key, len(tickets))
+        log.info("Jira export complete for %s (%d tickets)", project_key, ticket_count)
 
     # ── Ticket Search ─────────────────────────────────────────────────────
 
-    def _search_tickets(self, project_key: str, checkpoint: CheckpointManager) -> list[dict]:
-        checkpoint.start_phase("tickets", total=self.limit)
-        tickets = []
+    def _search_tickets(self, project_key: str, checkpoint: CheckpointManager) -> None:
+        """Search and save tickets to S3. Uses NDJSONWriter to keep memory bounded."""
+        checkpoint.start_phase("tickets", total=self.limit or None)
+        s3_base = f"jira/{project_key}"
+        writer = NDJSONWriter(self.s3, f"{s3_base}/_tickets_wip.json")
         jql = f"project = {project_key} ORDER BY created DESC"
         next_page_token = checkpoint.get_cursor("tickets")
 
-        while len(tickets) < self.limit:
-            body = {
-                "jql": jql,
-                "maxResults": min(100, self.limit - len(tickets)),
-                "fields": ["*navigable", "attachment", "comment"],
-                "expand": "changelog,renderedFields",
-            }
-            if next_page_token:
-                body["nextPageToken"] = next_page_token
+        try:
+            while True:
+                batch_size = 100
+                if self.limit:
+                    batch_size = min(100, self.limit - writer.count)
+                    if batch_size <= 0:
+                        break
+                body = {
+                    "jql": jql,
+                    "maxResults": batch_size,
+                    "fields": ["*navigable", "attachment", "comment"],
+                    "expand": "changelog,renderedFields",
+                }
+                if next_page_token:
+                    body["nextPageToken"] = next_page_token
 
-            resp = self.session.post(f"{self.base_url}/search/jql", json=body)
-            resp.raise_for_status()
-            data = resp.json()
+                resp = self.session.post(f"{self.base_url}/search/jql", json=body)
+                resp.raise_for_status()
+                data = resp.json()
 
-            log.debug("Search response keys: %s, issues count: %d",
-                      list(data.keys()), len(data.get("issues", [])))
+                log.debug("Search response keys: %s, issues count: %d",
+                          list(data.keys()), len(data.get("issues", [])))
 
-            for issue in data.get("issues", []):
-                ticket = self._parse_ticket(issue)
-                tickets.append(ticket)
-                checkpoint.mark_item_done("tickets", ticket["key"])
+                for issue in data.get("issues", []):
+                    ticket = self._parse_ticket(issue)
+                    writer.append(ticket)
+                    checkpoint.mark_item_done("tickets", ticket["key"])
 
-            next_page_token = data.get("nextPageToken")
-            checkpoint.set_cursor("tickets", next_page_token)
-            checkpoint.save()
+                next_page_token = data.get("nextPageToken")
+                checkpoint.set_cursor("tickets", next_page_token)
+                checkpoint.save()
 
-            if not next_page_token or not data.get("issues"):
-                break
+                if not next_page_token or not data.get("issues"):
+                    break
 
-        # Save intermediate results
-        s3_base = f"jira/{project_key}"
+            # Read back from disk, upload final JSON array
+            tickets = writer.read_all()
+        finally:
+            writer.close()
+
         self.s3.upload_json(tickets, f"{s3_base}/tickets.json")
         log.info("Fetched %d tickets for %s", len(tickets), project_key)
-        return tickets
+        del tickets
 
     def _parse_ticket(self, issue: dict) -> dict:
         fields = issue.get("fields", {})
@@ -450,7 +475,7 @@ def main():
     parser.add_argument("--input-csv", default=env("JIRA_INPUT_CSV"), help="CSV file with 'project' column")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
-    parser.add_argument("--limit", type=int, default=env_int("JIRA_LIMIT", 100), help="Max tickets per project")
+    parser.add_argument("--limit", type=int, default=env_int("JIRA_LIMIT", 0), help="Max tickets per project (0=all)")
     parser.add_argument("--skip-attachments", action="store_true", default=env_bool("JIRA_SKIP_ATTACHMENTS"))
     parser.add_argument("--skip-comments", action="store_true", default=env_bool("JIRA_SKIP_COMMENTS"))
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))

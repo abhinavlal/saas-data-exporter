@@ -47,3 +47,17 @@ class TestReadCsvColumn:
         csv_file.write_text("user\n")
         result = read_csv_column(csv_file, "user")
         assert result == []
+
+    def test_skips_malformed_values(self, tmp_path):
+        """Bare punctuation like '-' should be skipped."""
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("user\nalice@test.com\n-\nbob@test.com\n---\n")
+        result = read_csv_column(csv_file, "user")
+        assert result == ["alice@test.com", "bob@test.com"]
+
+    def test_allows_values_with_special_chars_and_alphanumeric(self, tmp_path):
+        """Values with at least one alphanumeric char should pass."""
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("repo\nowner/repo-1\nowner_repo.2\n")
+        result = read_csv_column(csv_file, "repo")
+        assert result == ["owner/repo-1", "owner_repo.2"]

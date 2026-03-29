@@ -3,6 +3,8 @@
 import json
 import io
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 import boto3
@@ -113,3 +115,60 @@ class S3Store:
             Config=LARGE_FILE_CONFIG,
             ExtraArgs={"ContentType": content_type},
         )
+
+class NDJSONWriter:
+    """Disk-backed NDJSON writer that avoids memory accumulation.
+
+    Records are written to a temp file on disk.  The file is uploaded to S3
+    periodically (every ``upload_every`` records) so that progress survives
+    crashes, and once more on ``close()``.
+
+    Usage:
+        writer = NDJSONWriter(s3_store, "path/to/data.ndjson")
+        for item in items:
+            writer.append(item)
+        all_items = writer.read_all()   # read back for sort / CSV
+        writer.close()                  # final upload + temp cleanup
+    """
+
+    def __init__(self, s3: 'S3Store', s3_path: str, upload_every: int = 500):
+        self._s3 = s3
+        self._s3_path = s3_path
+        self._upload_every = upload_every
+        self._tmpfile = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ndjson", delete=False,
+        )
+        self._tmppath = self._tmpfile.name
+        self.count = 0
+
+    def append(self, record: dict) -> None:
+        self._tmpfile.write(json.dumps(record, default=str) + "\n")
+        self.count += 1
+        if self.count % self._upload_every == 0:
+            self._upload()
+
+    def _upload(self) -> None:
+        self._tmpfile.flush()
+        self._s3.upload_file(
+            self._tmppath, self._s3_path, content_type="application/json",
+        )
+
+    def read_all(self) -> list[dict]:
+        """Read all records back from disk (for sorting / CSV generation)."""
+        self._tmpfile.flush()
+        items = []
+        with open(self._tmppath) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.append(json.loads(line))
+        return items
+
+    def close(self) -> None:
+        """Final upload and temp-file cleanup."""
+        self._upload()
+        self._tmpfile.close()
+        try:
+            os.unlink(self._tmppath)
+        except OSError:
+            pass

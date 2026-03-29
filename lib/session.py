@@ -43,12 +43,22 @@ class RateLimitState:
                 self.reset_at = float(headers["X-RateLimit-Reset"])
 
     def should_preemptive_wait(self, min_remaining: int = 50) -> float | None:
-        """Returns seconds to wait if remaining quota is dangerously low."""
+        """Returns seconds to wait if remaining quota is dangerously low.
+
+        When remaining is 0: wait until full reset.
+        When remaining < min_remaining: spread remaining requests across the
+        remaining window to avoid bursting into a wall.
+        """
         with self._lock:
-            if self.remaining is not None and self.remaining < min_remaining:
-                if self.reset_at is not None:
-                    wait = max(0.0, self.reset_at - time.time() + 1.0)
-                    return wait
+            if self.remaining is None or self.reset_at is None:
+                return None
+            if self.remaining <= 0:
+                # Fully exhausted — must wait for reset
+                return max(0.0, self.reset_at - time.time() + 1.0)
+            if self.remaining < min_remaining:
+                # Spread remaining requests across the window
+                time_left = max(1.0, self.reset_at - time.time())
+                return time_left / self.remaining
             return None
 
 
