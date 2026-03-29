@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from lib.s3 import S3Store
@@ -322,12 +323,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print summary without writing to S3")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=True)
+    parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"), help="Directory for log files")
     args = parser.parse_args()
 
     if not args.s3_bucket:
         parser.error("--s3-bucket is required (or set S3_BUCKET)")
 
-    setup_logging(level=args.log_level, json_output=not args.no_json_logs)
+    log_file = os.path.join(args.log_dir, "catalog.log")
+    setup_logging(level=args.log_level, json_output=not args.no_json_logs, log_file=log_file)
     s3 = S3Store(bucket=args.s3_bucket, prefix=args.s3_prefix)
     generator = CatalogGenerator(s3, dry_run=args.dry_run, exporter_filter=args.exporter)
     generator.run()

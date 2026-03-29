@@ -29,6 +29,7 @@ build/
 
 # Logs
 *.log
+logs/
 
 # Claude Code session log
 .claude/memory/session-log.md
