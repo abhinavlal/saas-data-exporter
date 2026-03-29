@@ -30,6 +30,9 @@ build/
 # Logs
 *.log
 
+# Claude Code session log
+.claude/memory/session-log.md
+
 # OS
 .DS_Store
 Thumbs.db
