@@ -242,19 +242,16 @@ class TestCalendarExport:
             )
             exporter.run()
 
-        # Check events.json
-        saved_events = store.download_json(f"google/{USER_SLUG}/calendar/events.json")
-        assert len(saved_events) == 2
-        assert saved_events[0]["summary"] == "Team Standup"
+        # Check per-event files
+        evt1 = store.download_json(f"google/{USER_SLUG}/calendar/events/evt1.json")
+        assert evt1["summary"] == "Team Standup"
+        assert evt1["location"] == "Room 101"
+        evt2 = store.download_json(f"google/{USER_SLUG}/calendar/events/evt2.json")
+        assert evt2["summary"] == "1:1"
 
-        # Check _summary.json
-        summary = store.download_json(f"google/{USER_SLUG}/calendar/_summary.json")
-        assert len(summary) == 2
-        assert summary[0]["title"] == "Team Standup"
-        assert summary[0]["organizer"] == "alice@test.com"
-        assert summary[0]["attendee_count"] == 2
-        assert summary[0]["location"] == "Room 101"
-        assert summary[1]["start"] == "2024-06-02"
+        # Check _index.json
+        index = store.download_json(f"google/{USER_SLUG}/calendar/_index.json")
+        assert index == ["evt1", "evt2"]
 
 
 # ── Drive Tests ───────────────────────────────────────────────────────────
@@ -414,8 +411,8 @@ class TestFullExport:
         expected = {
             f"google/{USER_SLUG}/gmail/m1.eml",
             f"google/{USER_SLUG}/gmail/_index.json",
-            f"google/{USER_SLUG}/calendar/events.json",
-            f"google/{USER_SLUG}/calendar/_summary.json",
+            f"google/{USER_SLUG}/calendar/events/e1.json",
+            f"google/{USER_SLUG}/calendar/_index.json",
             f"google/{USER_SLUG}/drive/_index.json",
         }
         assert expected.issubset(keys), f"Missing keys: {expected - keys}"

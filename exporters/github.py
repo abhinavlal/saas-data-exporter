@@ -6,7 +6,7 @@ import io
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store, NDJSONWriter
+from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
 from lib.session import make_session
 from lib.logging import setup_logging
@@ -155,42 +155,40 @@ class GitHubExporter:
                  self.commit_limit or "all", self.commit_details)
         self.checkpoint.start_phase("commits", total=self.commit_limit or None)
 
-        # Step 1: paginate commit list (list API returns basic info per commit)
+        # Step 1: paginate commit list — write each commit to its own S3 file
         commits = self._list_commits()
         log.info("Fetched %d commits from list API", len(commits))
 
-        # Step 2: optionally fetch full details (stats, file changes, patches)
-        # This costs 1 API call per commit — only use for small repos
+        for c in commits:
+            sha = c["sha"]
+            if not self.checkpoint.is_item_done("commits", sha):
+                self.s3.upload_json(c, f"{self.s3_base}/commits/{sha}.json")
+                self.checkpoint.mark_item_done("commits", sha)
+        self.checkpoint.save()
+
+        # Step 2: optionally overwrite with full details (stats, files, patches)
         if self.commit_details:
             to_fetch = [c["sha"] for c in commits
-                        if not self.checkpoint.is_item_done("commits", c["sha"])]
+                        if not self.checkpoint.is_item_done("commit_details", c["sha"])]
             log.info("Fetching full details for %d commits (%d already done)",
                      len(to_fetch), len(commits) - len(to_fetch))
 
-            writer = NDJSONWriter(self.s3, f"{self.s3_base}/_commits_wip.json")
-            try:
-                with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-                    futures = {pool.submit(self._fetch_commit_detail, sha): sha for sha in to_fetch}
-                    for future in as_completed(futures):
-                        sha = futures[future]
-                        try:
-                            commit = future.result()
-                            if commit:
-                                writer.append(commit)
-                            self.checkpoint.mark_item_done("commits", sha)
-                            self.checkpoint.save()
-                        except Exception:
-                            log.error("Failed to fetch commit %s", sha, exc_info=True)
-                # Read back, sort, and upload final JSON
-                commits = writer.read_all()
-                commits.sort(key=lambda c: c.get("author_date", ""), reverse=True)
-            finally:
-                writer.close()
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+                futures = {pool.submit(self._fetch_commit_detail, sha): sha for sha in to_fetch}
+                for future in as_completed(futures):
+                    sha = futures[future]
+                    try:
+                        commit = future.result()
+                        if commit:
+                            self.s3.upload_json(commit, f"{self.s3_base}/commits/{sha}.json")
+                        self.checkpoint.mark_item_done("commit_details", sha)
+                        self.checkpoint.save()
+                    except Exception:
+                        log.error("Failed to fetch commit %s", sha, exc_info=True)
 
-        self.s3.upload_json(commits, f"{self.s3_base}/commits.json")
         self.checkpoint.complete_phase("commits")
         self.checkpoint.save(force=True)
-        log.info("Exported %d commits", len(commits))
+        log.info("Exported %d commits for %s", len(commits), self.repo)
 
     def _list_commits(self) -> list[dict]:
         """Paginate the commit list API. Returns basic commit data (no file stats)."""
@@ -284,37 +282,32 @@ class GitHubExporter:
         pr_numbers = self._list_pr_numbers()
         log.info("Found %d PRs", len(pr_numbers))
 
-        # Step 2: fetch full details in parallel, writing to disk to avoid memory buildup
+        # Step 2: fetch full details in parallel — each PR written to its own S3 file
         to_fetch = [n for n in pr_numbers if not self.checkpoint.is_item_done("pull_requests", n)]
         log.info("Fetching details for %d PRs (%d already done)",
                  len(to_fetch), len(pr_numbers) - len(to_fetch))
 
-        writer = NDJSONWriter(self.s3, f"{self.s3_base}/_prs_wip.json")
-        try:
-            with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-                futures = {pool.submit(self._fetch_pr_detail, n): n for n in to_fetch}
-                for future in as_completed(futures):
-                    number = futures[future]
-                    try:
-                        pr = future.result()
-                        if pr:
-                            writer.append(pr)
-                        self.checkpoint.mark_item_done("pull_requests", number)
-                        self.checkpoint.save()
-                    except Exception:
-                        log.error("Failed to fetch PR #%d", number, exc_info=True)
+        csv_rows = []
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+            futures = {pool.submit(self._fetch_pr_detail, n): n for n in to_fetch}
+            for future in as_completed(futures):
+                number = futures[future]
+                try:
+                    pr = future.result()
+                    if pr:
+                        # Write individual PR file — full data, memory freed immediately
+                        self.s3.upload_json(pr, f"{self.s3_base}/prs/{number}.json")
+                        csv_rows.append(self._pr_to_csv_row(pr))
+                    self.checkpoint.mark_item_done("pull_requests", number)
+                    self.checkpoint.save()
+                except Exception:
+                    log.error("Failed to fetch PR #%d", number, exc_info=True)
 
-            # Read back from disk for sort + final JSON + CSV upload
-            prs = writer.read_all()
-        finally:
-            writer.close()
-
-        prs.sort(key=lambda p: p.get("number", 0), reverse=True)
-        self.s3.upload_json(prs, f"{self.s3_base}/pull_requests.json")
-        self._upload_pr_csv(prs)
+        csv_rows.sort(key=lambda r: r.get("number", 0), reverse=True)
+        self._upload_pr_csv(csv_rows)
         self.checkpoint.complete_phase("pull_requests")
         self.checkpoint.save(force=True)
-        log.info("Exported %d pull requests", len(prs))
+        log.info("Exported %d pull requests", len(csv_rows))
 
     def _list_pr_numbers(self) -> list[int]:
         numbers = []
@@ -481,8 +474,36 @@ class GitHubExporter:
 
     # ── CSV ───────────────────────────────────────────────────────────────
 
-    def _upload_pr_csv(self, prs: list[dict]) -> None:
-        if not prs:
+    @staticmethod
+    def _pr_to_csv_row(pr: dict) -> dict:
+        """Extract lightweight CSV row from a full PR dict."""
+        body = pr.get("body") or ""
+        return {
+            "number": pr.get("number"),
+            "title": pr.get("title"),
+            "state": pr.get("state"),
+            "author": pr.get("author"),
+            "created_at": pr.get("created_at"),
+            "updated_at": pr.get("updated_at"),
+            "closed_at": pr.get("closed_at"),
+            "merged_at": pr.get("merged_at"),
+            "draft": pr.get("draft"),
+            "body": body[:1000],
+            "head_ref": pr.get("head_ref"),
+            "base_ref": pr.get("base_ref"),
+            "labels": "|".join(pr.get("labels", [])),
+            "assignees": "|".join(pr.get("assignees", [])),
+            "requested_reviewers": "|".join(pr.get("requested_reviewers", [])),
+            "additions": pr.get("additions"),
+            "deletions": pr.get("deletions"),
+            "changed_files": pr.get("changed_files"),
+            "review_count": len(pr.get("reviews", [])),
+            "comment_count": len(pr.get("comments", [])),
+            "html_url": pr.get("html_url"),
+        }
+
+    def _upload_pr_csv(self, rows: list[dict]) -> None:
+        if not rows:
             self.s3.upload_bytes(b"", f"{self.s3_base}/pull_requests.csv", "text/csv")
             return
 
@@ -495,32 +516,8 @@ class GitHubExporter:
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
-
-        for pr in prs:
-            body = pr.get("body") or ""
-            writer.writerow({
-                "number": pr.get("number"),
-                "title": pr.get("title"),
-                "state": pr.get("state"),
-                "author": pr.get("author"),
-                "created_at": pr.get("created_at"),
-                "updated_at": pr.get("updated_at"),
-                "closed_at": pr.get("closed_at"),
-                "merged_at": pr.get("merged_at"),
-                "draft": pr.get("draft"),
-                "body": body[:1000],
-                "head_ref": pr.get("head_ref"),
-                "base_ref": pr.get("base_ref"),
-                "labels": "|".join(pr.get("labels", [])),
-                "assignees": "|".join(pr.get("assignees", [])),
-                "requested_reviewers": "|".join(pr.get("requested_reviewers", [])),
-                "additions": pr.get("additions"),
-                "deletions": pr.get("deletions"),
-                "changed_files": pr.get("changed_files"),
-                "review_count": len(pr.get("reviews", [])),
-                "comment_count": len(pr.get("comments", [])),
-                "html_url": pr.get("html_url"),
-            })
+        for row in rows:
+            writer.writerow(row)
 
         self.s3.upload_bytes(
             output.getvalue().encode("utf-8"),

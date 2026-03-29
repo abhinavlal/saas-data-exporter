@@ -1,12 +1,11 @@
 """Slack Channel Exporter — exports channel info, messages, threads, and attachments to S3."""
 
 import argparse
-import io
 import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store, NDJSONWriter
+from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
 from lib.session import make_session
 from lib.logging import setup_logging
@@ -86,38 +85,22 @@ class SlackExporter:
         if not checkpoint.is_phase_done("channel_info"):
             self._fetch_and_upload_channel_info(channel_id, s3_base, checkpoint)
 
-        # Step 2: messages (saves to S3 when done)
+        # Step 2: messages — each written to messages/{ts}.json
         if not checkpoint.is_phase_done("messages"):
-            self._fetch_messages(channel_id, checkpoint)
+            self._fetch_messages(channel_id, s3_base, checkpoint)
 
-        # Step 3: thread replies — reload from S3 to avoid holding messages
-        # across phases
+        # Step 3: thread replies — load each parent, fetch replies, update file
         if self.include_threads and not checkpoint.is_phase_done("threads"):
-            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
-            messages = self._fetch_thread_replies(channel_id, messages, checkpoint)
-            messages.sort(key=lambda m: _safe_ts(m))
-            self.s3.upload_json(messages, f"{s3_base}/messages.json")
-            del messages
+            self._fetch_thread_replies(channel_id, s3_base, checkpoint)
 
-        # Step 4: download attachments — reload from S3
+        # Step 4: download attachments — iterate message index
         if not self.skip_attachments and not checkpoint.is_phase_done("attachments"):
-            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
-            self._download_attachments(messages, channel_id, s3_base, checkpoint)
-            # Re-save messages with _local_file references added
-            messages.sort(key=lambda m: _safe_ts(m))
-            self.s3.upload_json(messages, f"{s3_base}/messages.json")
-            msg_count = len(messages)
-            del messages
-        else:
-            messages = self.s3.download_json(f"{s3_base}/messages.json") or []
-            # Ensure final sort even if no threads/attachments phase ran
-            messages.sort(key=lambda m: _safe_ts(m))
-            self.s3.upload_json(messages, f"{s3_base}/messages.json")
-            msg_count = len(messages)
-            del messages
+            self._download_attachments_from_index(channel_id, s3_base, checkpoint)
 
+        # Load index for final count
+        index = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
         checkpoint.complete()
-        log.info("Slack export complete for channel %s (%d messages)", channel_id, msg_count)
+        log.info("Slack export complete for channel %s (%d messages)", channel_id, len(index))
 
     # ── Channel Info ──────────────────────────────────────────────────────
 
@@ -140,89 +123,83 @@ class SlackExporter:
 
     # ── Messages ──────────────────────────────────────────────────────────
 
-    def _fetch_messages(self, channel_id: str, checkpoint: CheckpointManager) -> None:
-        """Fetch all messages and save to S3. Memory is released after save."""
+    def _fetch_messages(self, channel_id: str, s3_base: str,
+                        checkpoint: CheckpointManager) -> None:
+        """Fetch messages and write each to messages/{ts}.json. Builds _index.json."""
         checkpoint.start_phase("messages")
-        s3_base = f"slack/{channel_id}"
-        writer = NDJSONWriter(self.s3, f"{s3_base}/_messages_wip.json")
+        ts_list: list[str] = []
         cursor = checkpoint.get_cursor("messages")
         params = {"channel": channel_id, "limit": 200}
         if cursor:
             params["cursor"] = cursor
 
-        try:
-            while True:
-                resp = self.session.get(f"{SLACK_API}/conversations.history", params=params)
-                resp.raise_for_status()
-                data = resp.json()
+        while True:
+            resp = self.session.get(f"{SLACK_API}/conversations.history", params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
-                if not data.get("ok"):
-                    log.error("conversations.history failed: %s", data.get("error"))
-                    break
+            if not data.get("ok"):
+                log.error("conversations.history failed: %s", data.get("error"))
+                break
 
-                for msg in data.get("messages", []):
-                    writer.append(msg)
-                    checkpoint.mark_item_done("messages", msg.get("ts"))
+            for msg in data.get("messages", []):
+                ts = msg.get("ts", "0")
+                self.s3.upload_json(msg, f"{s3_base}/messages/{ts}.json")
+                ts_list.append(ts)
+                checkpoint.mark_item_done("messages", ts)
 
-                next_cursor = data.get("response_metadata", {}).get("next_cursor")
-                checkpoint.set_cursor("messages", next_cursor)
-                checkpoint.save()
+            next_cursor = data.get("response_metadata", {}).get("next_cursor")
+            checkpoint.set_cursor("messages", next_cursor)
+            checkpoint.save()
 
-                if not next_cursor:
-                    break
-                params["cursor"] = next_cursor
+            if not next_cursor:
+                break
+            params["cursor"] = next_cursor
 
-            # Read back from disk, upload final JSON array
-            messages = writer.read_all()
-        finally:
-            writer.close()
-
-        self.s3.upload_json(messages, f"{s3_base}/messages.json")
-        log.info("Fetched %d messages from %s", len(messages), channel_id)
-        del messages
+        # Write lightweight index (just timestamps)
+        self.s3.upload_json(ts_list, f"{s3_base}/messages/_index.json")
         checkpoint.complete_phase("messages")
         checkpoint.save(force=True)
+        log.info("Fetched %d messages from %s", len(ts_list), channel_id)
 
     # ── Thread Replies ────────────────────────────────────────────────────
 
-    def _fetch_thread_replies(self, channel_id: str, messages: list[dict],
-                              checkpoint: CheckpointManager) -> list[dict]:
+    def _fetch_thread_replies(self, channel_id: str, s3_base: str,
+                              checkpoint: CheckpointManager) -> None:
+        """Fetch thread replies and embed them as a `_replies` array inside
+        the parent message file. One parent loaded at a time."""
         checkpoint.start_phase("threads")
-        thread_parents = [m for m in messages if m.get("reply_count", 0) > 0 and m.get("thread_ts")]
+        index = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
+
+        # Find thread parents by loading each message
+        thread_parents = []
+        for ts in index:
+            msg = self.s3.download_json(f"{s3_base}/messages/{ts}.json")
+            if msg and msg.get("reply_count", 0) > 0 and msg.get("thread_ts"):
+                thread_parents.append(ts)
+
         log.info("Fetching replies for %d threads", len(thread_parents))
+        reply_count = 0
 
-        all_replies = []
-
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {}
-            for msg in thread_parents:
-                thread_ts = msg["thread_ts"]
-                if checkpoint.is_item_done("threads", thread_ts):
-                    continue
-                futures[pool.submit(self._fetch_single_thread, channel_id, thread_ts)] = thread_ts
-
-            for future in as_completed(futures):
-                thread_ts = futures[future]
-                try:
-                    replies = future.result()
-                    all_replies.extend(replies)
-                    checkpoint.mark_item_done("threads", thread_ts)
-                    checkpoint.save()
-                except Exception:
-                    log.error("Failed to fetch thread %s", thread_ts, exc_info=True)
-
-        # Merge replies into messages list (inline with metadata)
-        existing_ts = {m.get("ts") for m in messages}
-        for reply in all_replies:
-            if reply.get("ts") not in existing_ts:
-                reply["_is_thread_reply"] = True
-                reply["_parent_ts"] = reply.get("thread_ts")
-                messages.append(reply)
+        for thread_ts in thread_parents:
+            if checkpoint.is_item_done("threads", thread_ts):
+                continue
+            try:
+                replies = self._fetch_single_thread(channel_id, thread_ts)
+                # Load parent, embed replies, re-upload
+                parent = self.s3.download_json(f"{s3_base}/messages/{thread_ts}.json")
+                if parent:
+                    parent["_replies"] = replies
+                    self.s3.upload_json(parent, f"{s3_base}/messages/{thread_ts}.json")
+                reply_count += len(replies)
+                checkpoint.mark_item_done("threads", thread_ts)
+                checkpoint.save()
+            except Exception:
+                log.error("Failed to fetch thread %s", thread_ts, exc_info=True)
 
         checkpoint.complete_phase("threads")
         checkpoint.save(force=True)
-        log.info("Fetched %d thread replies", len(all_replies))
-        return messages
+        log.info("Fetched %d thread replies across %d threads", reply_count, len(thread_parents))
 
     def _fetch_single_thread(self, channel_id: str, thread_ts: str) -> list[dict]:
         replies = []
@@ -254,45 +231,46 @@ class SlackExporter:
 
     # ── Attachments ───────────────────────────────────────────────────────
 
-    def _download_attachments(self, messages: list[dict], channel_id: str,
-                              s3_base: str, checkpoint: CheckpointManager) -> None:
+    def _download_attachments_from_index(self, channel_id: str, s3_base: str,
+                                        checkpoint: CheckpointManager) -> None:
+        """Download attachments by iterating message index — one message at a time."""
         checkpoint.start_phase("attachments")
-        downloads = []
-        for msg in messages:
+        index = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
+        download_count = 0
+
+        for ts in index:
+            msg = self.s3.download_json(f"{s3_base}/messages/{ts}.json")
+            if not msg or "files" not in msg:
+                continue
+            updated = False
             for file_obj in msg.get("files", []):
                 if _is_skippable_file(file_obj):
                     continue
                 file_id = file_obj.get("id", "unknown")
+                if checkpoint.is_item_done("attachments", file_id):
+                    continue
                 name = file_obj.get("name", "unknown")
                 url = file_obj.get("url_private_download") or file_obj.get("url_private")
                 if not url:
                     continue
                 s3_filename = f"{file_id}_{name}"
                 s3_path = f"{s3_base}/attachments/{s3_filename}"
-                downloads.append((file_id, url, s3_path, s3_filename, file_obj))
-
-        log.info("Downloading %d attachments for channel %s", len(downloads), channel_id)
-
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {}
-            for file_id, url, s3_path, s3_filename, file_obj in downloads:
-                if checkpoint.is_item_done("attachments", file_id):
-                    file_obj["_local_file"] = f"attachments/{s3_filename}"
-                    continue
-                futures[pool.submit(self._download_one_file, url, s3_path)] = (file_id, s3_filename, file_obj)
-
-            for future in as_completed(futures):
-                file_id, s3_filename, file_obj = futures[future]
                 try:
-                    future.result()
+                    self._download_one_file(url, s3_path)
                     file_obj["_local_file"] = f"attachments/{s3_filename}"
+                    updated = True
+                    download_count += 1
                     checkpoint.mark_item_done("attachments", file_id)
                     checkpoint.save()
                 except Exception:
                     log.error("Failed to download file %s", file_id, exc_info=True)
+            # Re-upload message with _local_file references
+            if updated:
+                self.s3.upload_json(msg, f"{s3_base}/messages/{ts}.json")
 
         checkpoint.complete_phase("attachments")
         checkpoint.save(force=True)
+        log.info("Downloaded %d attachments for channel %s", download_count, channel_id)
 
     def _download_one_file(self, url: str, s3_path: str) -> None:
         """Download a file and upload to S3. Uses requests timeout (no signal-based timeout)."""

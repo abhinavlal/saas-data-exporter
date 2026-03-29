@@ -135,8 +135,15 @@ class NDJSONWriter:
         self._s3 = s3
         self._s3_path = s3_path
         self._upload_every = upload_every
+        # Prefer a real-disk temp dir over /tmp which may be tmpfs (RAM-backed).
+        # Fall back to the default temp directory if the preferred path doesn't exist.
+        tmp_dir = None
+        for candidate in ("/var/tmp",):
+            if os.path.isdir(candidate):
+                tmp_dir = candidate
+                break
         self._tmpfile = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".ndjson", delete=False,
+            mode="w", suffix=".ndjson", delete=False, dir=tmp_dir,
         )
         self._tmppath = self._tmpfile.name
         self.count = 0

@@ -7,7 +7,7 @@ import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store, NDJSONWriter
+from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
 from lib.session import make_session
 from lib.logging import setup_logging
@@ -104,100 +104,103 @@ class JiraExporter:
         if self._field_map is None:
             self._field_map = self._resolve_custom_fields()
 
-        # Step 1: search tickets (saves intermediate results to S3)
+        # Step 1: search tickets — writes each ticket to tickets/{key}.json
         if not checkpoint.is_phase_done("tickets"):
             self._search_tickets(project_key, checkpoint)
             checkpoint.complete_phase("tickets")
             checkpoint.save(force=True)
 
-        # Step 2: fetch comments — reload tickets from S3 to avoid holding
-        # the full search-phase list in memory across phases
+        # Load index (lightweight list of keys + custom field names)
+        index = self.s3.download_json(f"{s3_base}/tickets/_index.json") or {"keys": [], "custom_fields": []}
+        ticket_keys = index["keys"]
+
+        # Step 2: fetch comments — one ticket at a time, never all in memory
         if not self.skip_comments and not checkpoint.is_phase_done("comments"):
-            tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
-            checkpoint.start_phase("comments", total=len(tickets))
-            for ticket in tickets:
-                key = ticket["key"]
+            checkpoint.start_phase("comments", total=len(ticket_keys))
+            for key in ticket_keys:
                 if checkpoint.is_item_done("comments", key):
                     continue
+                ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
                 ticket["comments"] = self._fetch_comments(key)
+                self.s3.upload_json(ticket, f"{s3_base}/tickets/{key}.json")
                 checkpoint.mark_item_done("comments", key)
                 checkpoint.save()
-            # Save enriched tickets and release memory
-            self.s3.upload_json(tickets, f"{s3_base}/tickets.json")
-            del tickets
             checkpoint.complete_phase("comments")
             checkpoint.save(force=True)
 
-        # Step 3: download attachments — reload from S3
+        # Step 3: download attachments — one ticket at a time
         if not self.skip_attachments and not checkpoint.is_phase_done("attachments"):
-            tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
             checkpoint.start_phase("attachments")
-            self._download_all_attachments(tickets, project_key, s3_base, checkpoint)
-            del tickets
+            for key in ticket_keys:
+                ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
+                self._download_ticket_attachments(ticket, s3_base, checkpoint)
             checkpoint.complete_phase("attachments")
             checkpoint.save(force=True)
 
-        # Step 4: upload final CSV (tickets.json is already up-to-date)
-        tickets = self.s3.download_json(f"{s3_base}/tickets.json") or []
-        self._upload_csv(tickets, s3_base)
-        ticket_count = len(tickets)
-        del tickets
+        # Step 4: generate CSV — one ticket at a time
+        self._upload_csv(ticket_keys, index.get("custom_fields", []), s3_base)
         checkpoint.complete()
-        log.info("Jira export complete for %s (%d tickets)", project_key, ticket_count)
+        log.info("Jira export complete for %s (%d tickets)", project_key, len(ticket_keys))
 
     # ── Ticket Search ─────────────────────────────────────────────────────
 
     def _search_tickets(self, project_key: str, checkpoint: CheckpointManager) -> None:
-        """Search and save tickets to S3. Uses NDJSONWriter to keep memory bounded."""
+        """Search tickets and write each to its own S3 file. Builds _index.json."""
         checkpoint.start_phase("tickets", total=self.limit or None)
         s3_base = f"jira/{project_key}"
-        writer = NDJSONWriter(self.s3, f"{s3_base}/_tickets_wip.json")
         jql = f"project = {project_key} ORDER BY created DESC"
         next_page_token = checkpoint.get_cursor("tickets")
+        ticket_count = 0
+        keys: list[str] = []
+        custom_fields: set[str] = set()
 
-        try:
-            while True:
-                batch_size = 100
-                if self.limit:
-                    batch_size = min(100, self.limit - writer.count)
-                    if batch_size <= 0:
-                        break
-                body = {
-                    "jql": jql,
-                    "maxResults": batch_size,
-                    "fields": ["*navigable", "attachment", "comment"],
-                    "expand": "changelog,renderedFields",
-                }
-                if next_page_token:
-                    body["nextPageToken"] = next_page_token
-
-                resp = self.session.post(f"{self.base_url}/search/jql", json=body)
-                resp.raise_for_status()
-                data = resp.json()
-
-                log.debug("Search response keys: %s, issues count: %d",
-                          list(data.keys()), len(data.get("issues", [])))
-
-                for issue in data.get("issues", []):
-                    ticket = self._parse_ticket(issue)
-                    writer.append(ticket)
-                    checkpoint.mark_item_done("tickets", ticket["key"])
-
-                next_page_token = data.get("nextPageToken")
-                checkpoint.set_cursor("tickets", next_page_token)
-                checkpoint.save()
-
-                if not next_page_token or not data.get("issues"):
+        while True:
+            batch_size = 100
+            if self.limit:
+                batch_size = min(100, self.limit - ticket_count)
+                if batch_size <= 0:
                     break
+            body = {
+                "jql": jql,
+                "maxResults": batch_size,
+                "fields": ["*navigable", "attachment", "comment"],
+                "expand": "changelog,renderedFields",
+            }
+            if next_page_token:
+                body["nextPageToken"] = next_page_token
 
-            # Read back from disk, upload final JSON array
-            tickets = writer.read_all()
-        finally:
-            writer.close()
+            resp = self.session.post(f"{self.base_url}/search/jql", json=body)
+            resp.raise_for_status()
+            data = resp.json()
 
-        self.s3.upload_json(tickets, f"{s3_base}/tickets.json")
-        log.info("Fetched %d tickets for %s", len(tickets), project_key)
-        del tickets
+            log.debug("Search response keys: %s, issues count: %d",
+                      list(data.keys()), len(data.get("issues", [])))
+
+            for issue in data.get("issues", []):
+                ticket = self._parse_ticket(issue)
+                key = ticket["key"]
+                # Write individual ticket file — memory freed immediately
+                self.s3.upload_json(ticket, f"{s3_base}/tickets/{key}.json")
+                keys.append(key)
+                custom_fields.update(
+                    k for k in ticket if k.startswith("Custom field")
+                )
+                checkpoint.mark_item_done("tickets", key)
+                ticket_count += 1
+
+            next_page_token = data.get("nextPageToken")
+            checkpoint.set_cursor("tickets", next_page_token)
+            checkpoint.save()
+
+            if not next_page_token or not data.get("issues"):
+                break
+
+        # Write lightweight index (just keys + field names, not ticket data)
+        self.s3.upload_json(
+            {"keys": keys, "custom_fields": sorted(custom_fields)},
+            f"{s3_base}/tickets/_index.json",
+        )
+        log.info("Fetched %d tickets for %s", ticket_count, project_key)
 
     def _parse_ticket(self, issue: dict) -> dict:
         fields = issue.get("fields", {})
@@ -363,37 +366,26 @@ class JiraExporter:
 
     # ── Attachments ───────────────────────────────────────────────────────
 
-    def _download_all_attachments(self, tickets: list[dict], project_key: str,
-                                  s3_base: str, checkpoint: CheckpointManager) -> None:
-        all_downloads = []
-        for ticket in tickets:
-            for att in ticket.get("attachments", []):
-                url = att.get("content_url")
-                if not url:
-                    continue
-                att_id = att.get("id", "unknown")
-                filename = att.get("filename", "unknown")
-                s3_path = f"{s3_base}/attachments/{ticket['key']}/{filename}"
-                all_downloads.append((att_id, url, s3_path, filename, ticket["key"]))
-
-        log.info("Downloading %d attachments for %s", len(all_downloads), project_key)
-
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {}
-            for att_id, url, s3_path, filename, ticket_key in all_downloads:
-                ck_id = f"{ticket_key}/{att_id}"
-                if checkpoint.is_item_done("attachments", ck_id):
-                    continue
-                futures[pool.submit(self._stream_attachment_to_s3, url, s3_path, filename)] = ck_id
-
-            for future in as_completed(futures):
-                ck_id = futures[future]
-                try:
-                    future.result()
-                    checkpoint.mark_item_done("attachments", ck_id)
-                    checkpoint.save()
-                except Exception:
-                    log.error("Failed to download attachment %s", ck_id, exc_info=True)
+    def _download_ticket_attachments(self, ticket: dict, s3_base: str,
+                                     checkpoint: CheckpointManager) -> None:
+        """Download attachments for a single ticket. One ticket in memory at a time."""
+        ticket_key = ticket["key"]
+        for att in ticket.get("attachments", []):
+            url = att.get("content_url")
+            if not url:
+                continue
+            att_id = att.get("id", "unknown")
+            ck_id = f"{ticket_key}/{att_id}"
+            if checkpoint.is_item_done("attachments", ck_id):
+                continue
+            filename = att.get("filename", "unknown")
+            s3_path = f"{s3_base}/attachments/{ticket_key}/{filename}"
+            try:
+                self._stream_attachment_to_s3(url, s3_path, filename)
+                checkpoint.mark_item_done("attachments", ck_id)
+                checkpoint.save()
+            except Exception:
+                log.error("Failed to download attachment %s", ck_id, exc_info=True)
 
     def _stream_attachment_to_s3(self, url: str, s3_path: str, filename: str) -> None:
         with tempfile.NamedTemporaryFile(suffix=f"_{filename}", delete=True) as tmp:
@@ -406,12 +398,13 @@ class JiraExporter:
 
     # ── CSV ───────────────────────────────────────────────────────────────
 
-    def _upload_csv(self, tickets: list[dict], s3_base: str) -> None:
-        if not tickets:
+    def _upload_csv(self, ticket_keys: list[str], custom_fields: list[str],
+                    s3_base: str) -> None:
+        """Generate CSV by loading one ticket at a time from S3."""
+        if not ticket_keys:
             self.s3.upload_bytes(b"", f"{s3_base}/tickets.csv", "text/csv")
             return
 
-        # Collect all field names (including custom fields)
         base_fields = [
             "key", "summary", "issue_type", "status", "status_category", "priority",
             "resolution", "project_key", "created", "updated", "resolved", "due_date",
@@ -420,18 +413,17 @@ class JiraExporter:
             "original_estimate", "remaining_estimate", "time_spent",
             "votes", "watchers", "comments_text", "attachment_filenames", "changelog_count",
         ]
-        custom_fields = sorted({
-            k for ticket in tickets for k in ticket
-            if k.startswith("Custom field")
-        })
-        fieldnames = base_fields + custom_fields
+        fieldnames = base_fields + list(custom_fields)
 
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
-        for ticket in tickets:
-            # Join comments as text
+        for key in ticket_keys:
+            ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
+            if not ticket:
+                continue
+
             comment_parts = []
             for c in ticket.get("comments", []):
                 comment_parts.append(f"[{c.get('created', '')}] {c.get('author', '')}: {c.get('body_text', '')}")
@@ -449,7 +441,6 @@ class JiraExporter:
                 "attachment_filenames": attachment_filenames,
                 "changelog_count": changelog_count,
             }
-            # Add custom fields
             for cf in custom_fields:
                 row[cf] = ticket.get(cf, "")
             writer.writerow(row)

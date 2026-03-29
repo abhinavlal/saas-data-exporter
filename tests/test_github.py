@@ -255,10 +255,10 @@ class TestCommitsExport:
         exporter.run()
 
         store, _, _ = s3_env
-        commits = store.download_json(f"github/{SLUG}/commits.json")
-        assert len(commits) == 3
-        c = commits[0]
-        assert "sha" in c
+        # Each commit is its own file
+        c = store.download_json(f"github/{SLUG}/commits/sha0.json")
+        assert c is not None
+        assert c["sha"] == "sha0"
         assert c["author_name"] == "Alice"
         assert c["author_login"] == "alice"
         # No stats/files from list API (only with --commit-details)
@@ -273,9 +273,8 @@ class TestCommitsExport:
         exporter.run()
 
         store, _, _ = s3_env
-        commits = store.download_json(f"github/{SLUG}/commits.json")
-        assert len(commits) == 3
-        c = commits[0]
+        # Detail mode writes per-commit files
+        c = store.download_json(f"github/{SLUG}/commits/sha0.json")
         assert c["stats"]["additions"] == 10
         assert len(c["files"]) == 1
 
@@ -290,9 +289,8 @@ class TestPullRequestsExport:
         exporter.run()
 
         store, _, _ = s3_env
-        prs = store.download_json(f"github/{SLUG}/pull_requests.json")
-        assert len(prs) == 2
-        pr = next(p for p in prs if p["number"] == 1)
+        # PRs are now individual files
+        pr = store.download_json(f"github/{SLUG}/prs/1.json")
         assert pr["author"] == "alice"
         assert pr["state"] == "closed"
         assert len(pr["reviews"]) == 1
@@ -339,7 +337,8 @@ class TestCheckpointResume:
         """Simulate partial commit detail fetch, then resume."""
         store, config, _ = s3_env
 
-        # Pre-populate checkpoint: metadata+contributors done, commits partially done
+        # Pre-populate checkpoint: metadata+contributors done,
+        # commits listed, sha0 detail already fetched
         from lib.checkpoint import CheckpointManager
         cp = CheckpointManager(store, f"github/{SLUG}")
         cp.load()
@@ -349,6 +348,7 @@ class TestCheckpointResume:
         cp.complete_phase("contributors")
         cp.start_phase("commits", total=3)
         cp.mark_item_done("commits", "sha0")
+        cp.mark_item_done("commit_details", "sha0")
         cp.save(force=True)
 
         # Mock APIs — metadata/contributors not needed (checkpointed)
@@ -357,13 +357,14 @@ class TestCheckpointResume:
         exporter = _make_exporter(s3_env, skip_commits=False, commit_limit=5, commit_details=True)
         exporter.run()
 
-        commits = store.download_json(f"github/{SLUG}/commits.json")
-        # Should have 2 commits (sha1, sha2) — sha0 was skipped
-        assert len(commits) == 2
-        shas = {c["sha"] for c in commits}
-        assert "sha0" not in shas
-        assert "sha1" in shas
-        assert "sha2" in shas
+        # All 3 commits have files; sha0 list-mode only (detail was checkpointed),
+        # sha1 and sha2 have full details
+        c1 = store.download_json(f"github/{SLUG}/commits/sha1.json")
+        c2 = store.download_json(f"github/{SLUG}/commits/sha2.json")
+        assert c1 is not None
+        assert c2 is not None
+        assert "stats" in c1  # detail-fetched
+        assert "stats" in c2
 
 
 class TestFullExport:
@@ -385,8 +386,9 @@ class TestFullExport:
         expected = {
             f"github/{SLUG}/repo_metadata.json",
             f"github/{SLUG}/contributors.json",
-            f"github/{SLUG}/commits.json",
-            f"github/{SLUG}/pull_requests.json",
+            f"github/{SLUG}/commits/sha0.json",
+            f"github/{SLUG}/commits/sha1.json",
+            f"github/{SLUG}/prs/1.json",
             f"github/{SLUG}/pull_requests.csv",
         }
         assert expected.issubset(keys)
