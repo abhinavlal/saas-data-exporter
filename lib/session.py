@@ -56,9 +56,9 @@ class RateLimitState:
                 # Fully exhausted — must wait for reset
                 return max(0.0, self.reset_at - time.time() + 1.0)
             if self.remaining < min_remaining:
-                # Spread remaining requests across the window
+                # Spread remaining requests across the window, capped at 30s
                 time_left = max(1.0, self.reset_at - time.time())
-                return time_left / self.remaining
+                return min(time_left / self.remaining, 30.0)
             return None
 
 
