@@ -276,6 +276,9 @@ class GitHubExporter:
         if resp.status_code == 404:
             log.warning("Commit %s not found (404)", sha)
             return None
+        if resp.status_code == 403:
+            log.warning("Commit %s forbidden (403) — token may lack repo access", sha)
+            return None
         resp.raise_for_status()
         c = resp.json()
 
@@ -382,6 +385,9 @@ class GitHubExporter:
         resp = self.session.get(f"{API_BASE}/repos/{self.repo}/pulls/{number}")
         if resp.status_code == 404:
             log.warning("PR #%d not found (404)", number)
+            return None
+        if resp.status_code == 403:
+            log.warning("PR #%d forbidden (403) — token may lack repo access", number)
             return None
         resp.raise_for_status()
         pr = resp.json()
