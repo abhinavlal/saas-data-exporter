@@ -249,9 +249,8 @@ class TestTicketExport:
         exporter.run()
 
         store, _, _ = s3_env
-        tickets = store.download_json(f"jira/{PROJECT}/tickets.json")
-        assert len(tickets) == 2
-        t = tickets[0]
+        # Tickets are now individual files
+        t = store.download_json(f"jira/{PROJECT}/tickets/TEST-1.json")
         assert t["key"] == "TEST-1"
         assert t["summary"] == "Test ticket"
         assert t["description_text"] == "Description text here"
@@ -268,6 +267,9 @@ class TestTicketExport:
         assert t["parent_key"] == "TEST-1"
         assert t["votes"] == 3
         assert t["watchers"] == 5
+        # Index lists all keys
+        index = store.download_json(f"jira/{PROJECT}/tickets/_index.json")
+        assert set(index["keys"]) == {"TEST-1", "TEST-2"}
 
     @responses.activate
     def test_custom_fields_renamed(self, s3_env):
@@ -278,8 +280,7 @@ class TestTicketExport:
         exporter.run()
 
         store, _, _ = s3_env
-        tickets = store.download_json(f"jira/{PROJECT}/tickets.json")
-        t = tickets[0]
+        t = store.download_json(f"jira/{PROJECT}/tickets/TEST-1.json")
         assert t["Custom field (CC)"] == "Custom Value"
         assert "customfield_10001" not in t
 
@@ -292,8 +293,8 @@ class TestTicketExport:
         exporter.run()
 
         store, _, _ = s3_env
-        tickets = store.download_json(f"jira/{PROJECT}/tickets.json")
-        changelog = tickets[0]["changelog"]
+        t = store.download_json(f"jira/{PROJECT}/tickets/TEST-1.json")
+        changelog = t["changelog"]
         assert len(changelog) == 1
         assert changelog[0]["field"] == "status"
         assert changelog[0]["from"] == "Open"
@@ -312,8 +313,8 @@ class TestCommentsExport:
         exporter.run()
 
         store, _, _ = s3_env
-        tickets = store.download_json(f"jira/{PROJECT}/tickets.json")
-        comments = tickets[0]["comments"]
+        t = store.download_json(f"jira/{PROJECT}/tickets/TEST-1.json")
+        comments = t["comments"]
         assert len(comments) == 1
         assert comments[0]["author"] == "Alice"
         assert comments[0]["body_text"] == "A comment"
@@ -395,7 +396,8 @@ class TestFullExport:
         resp = conn.list_objects_v2(Bucket="test-bucket", Prefix=f"jira/{PROJECT}/")
         keys = {obj["Key"] for obj in resp.get("Contents", [])}
         expected = {
-            f"jira/{PROJECT}/tickets.json",
+            f"jira/{PROJECT}/tickets/TEST-1.json",
+            f"jira/{PROJECT}/tickets/_index.json",
             f"jira/{PROJECT}/tickets.csv",
             f"jira/{PROJECT}/attachments/TEST-1/report.pdf",
         }

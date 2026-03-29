@@ -66,8 +66,6 @@ class TestEmptyExports:
         )
         exporter.run()
 
-        assert store.download_json("github/owner__empty/commits.json") == []
-        assert store.download_json("github/owner__empty/pull_requests.json") == []
         assert store.download_json("github/owner__empty/contributors.json") == []
         # Metadata should still have language_breakdown (empty)
         meta = store.download_json("github/owner__empty/repo_metadata.json")
@@ -89,8 +87,8 @@ class TestEmptyExports:
         )
         exporter.run()
 
-        tickets = store.download_json("jira/EMPTY/tickets.json")
-        assert tickets == []
+        index = store.download_json("jira/EMPTY/tickets/_index.json")
+        assert index["keys"] == []
 
     @responses.activate
     def test_slack_empty_channel(self, s3_env):
@@ -107,8 +105,8 @@ class TestEmptyExports:
         )
         exporter.run()
 
-        messages = store.download_json("slack/C0EMPTY/messages.json")
-        assert messages == []
+        index = store.download_json("slack/C0EMPTY/messages/_index.json")
+        assert index == []
 
     def test_google_empty_drive(self, s3_env, mock_google_credentials):
         store, config, _ = s3_env
@@ -260,10 +258,10 @@ class TestCheckpointOnError:
         )
         exporter.run()
 
-        # Export should complete despite sha2 failing
-        commits = store.download_json("github/owner__repo/commits.json")
-        assert len(commits) == 1
-        assert commits[0]["sha"] == "sha1"
+        # Export should complete despite sha2 failing — sha1 written as individual file
+        c = store.download_json("github/owner__repo/commits/sha1.json")
+        assert c is not None
+        assert c["sha"] == "sha1"
 
         # Checkpoint should be completed
         cp = CheckpointManager(store, "github/owner__repo")
@@ -339,8 +337,8 @@ class TestSlackMalformedTimestamp:
         )
         exporter.run()  # Should not crash
 
-        messages = store.download_json("slack/CTS/messages.json")
-        assert len(messages) == 3
+        index = store.download_json("slack/CTS/messages/_index.json")
+        assert len(index) == 3
 
 
 class TestCsvEdgeCases:
@@ -396,8 +394,8 @@ class TestPerTargetErrorHandling:
         exporter.run()  # Should not raise
 
         # The OK project should still have been exported
-        tickets = store.download_json("jira/OK/tickets.json")
-        assert tickets == []
+        index = store.download_json("jira/OK/tickets/_index.json")
+        assert index["keys"] == []
 
     @responses.activate
     def test_slack_continues_after_channel_failure(self, s3_env):
@@ -421,5 +419,5 @@ class TestPerTargetErrorHandling:
         )
         exporter.run()  # Should not raise
 
-        messages = store.download_json("slack/COK/messages.json")
-        assert messages == []
+        index = store.download_json("slack/COK/messages/_index.json")
+        assert index == []

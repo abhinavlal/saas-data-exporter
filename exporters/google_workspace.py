@@ -260,13 +260,14 @@ class GoogleWorkspaceExporter:
         service = self._build_service("calendar", "v3")
 
         time_min = (datetime.now(timezone.utc) - timedelta(days=730)).isoformat()
-        events = []
+        event_count = 0
+        event_ids: list[str] = []
         page_token = None
 
         while True:
             batch_size = 250
             if self.event_limit:
-                batch_size = min(250, self.event_limit - len(events))
+                batch_size = min(250, self.event_limit - event_count)
                 if batch_size <= 0:
                     break
             try:
@@ -283,37 +284,25 @@ class GoogleWorkspaceExporter:
                 break
 
             for event in resp.get("items", []):
-                events.append(event)
-                if self.event_limit and len(events) >= self.event_limit:
+                event_id = event.get("id", f"unknown_{event_count}")
+                # Write per-event file
+                self.s3.upload_json(event, f"{self.s3_base}/calendar/events/{event_id}.json")
+                event_ids.append(event_id)
+                event_count += 1
+                self.checkpoint.mark_item_done("calendar", event_id)
+                if self.event_limit and event_count >= self.event_limit:
                     break
 
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
 
-        # Full events
-        self.s3.upload_json(events, f"{self.s3_base}/calendar/events.json")
-
-        # Lightweight summary
-        summary = []
-        for e in events:
-            start = e.get("start", {})
-            start_time = start.get("dateTime") or start.get("date")
-            summary.append({
-                "id": e.get("id"),
-                "title": e.get("summary"),
-                "start": start_time,
-                "status": e.get("status"),
-                "organizer": (e.get("organizer") or {}).get("email"),
-                "attendee_count": len(e.get("attendees", [])),
-                "location": e.get("location"),
-                "hangout_link": e.get("hangoutLink"),
-            })
-        self.s3.upload_json(summary, f"{self.s3_base}/calendar/_summary.json")
+        # Write index
+        self.s3.upload_json(event_ids, f"{self.s3_base}/calendar/_index.json")
 
         self.checkpoint.complete_phase("calendar")
         self.checkpoint.save(force=True)
-        log.info("Exported %d calendar events", len(events))
+        log.info("Exported %d calendar events", event_count)
 
     # ── Drive ─────────────────────────────────────────────────────────────
 

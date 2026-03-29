@@ -143,18 +143,20 @@ class TestChannelInfoExport:
 
 class TestMessagesExport:
     @responses.activate
-    def test_exports_messages_sorted(self, s3_env):
+    def test_exports_messages_as_individual_files(self, s3_env):
         mock_channel_info()
         mock_messages()
         exporter = _make_exporter(s3_env)
         exporter.run()
 
         store, _, _ = s3_env
-        messages = store.download_json(f"slack/{CHANNEL}/messages.json")
-        assert len(messages) == 2
-        # Should be sorted chronologically
-        assert messages[0]["ts"] < messages[1]["ts"]
-        assert messages[0]["text"] == "Hello!"
+        index = store.download_json(f"slack/{CHANNEL}/messages/_index.json")
+        assert len(index) == 2
+        # Each message has its own file
+        msg1 = store.download_json(f"slack/{CHANNEL}/messages/1700000001.000000.json")
+        assert msg1["text"] == "Hello!"
+        msg2 = store.download_json(f"slack/{CHANNEL}/messages/1700000002.000000.json")
+        assert msg2["text"] == "Hi there"
 
     @responses.activate
     def test_paginates_messages(self, s3_env):
@@ -165,8 +167,8 @@ class TestMessagesExport:
         exporter.run()
 
         store, _, _ = s3_env
-        messages = store.download_json(f"slack/{CHANNEL}/messages.json")
-        assert len(messages) == 3
+        index = store.download_json(f"slack/{CHANNEL}/messages/_index.json")
+        assert len(index) == 3
 
 
 # ── Thread Reply Tests ────────────────────────────────────────────────────
@@ -196,12 +198,14 @@ class TestThreadReplies:
         exporter.run()
 
         store, _, _ = s3_env
-        messages = store.download_json(f"slack/{CHANNEL}/messages.json")
-        # Parent + 2 replies
-        assert len(messages) == 3
-        replies = [m for m in messages if m.get("_is_thread_reply")]
-        assert len(replies) == 2
-        assert replies[0]["_parent_ts"] == "1700000001.000000"
+        index = store.download_json(f"slack/{CHANNEL}/messages/_index.json")
+        # Only the parent message in index (replies embedded inside it)
+        assert len(index) == 1
+        # Check parent has _replies embedded
+        parent = store.download_json(f"slack/{CHANNEL}/messages/1700000001.000000.json")
+        assert len(parent["_replies"]) == 2
+        assert parent["_replies"][0]["text"] == "Reply 1"
+        assert parent["_replies"][1]["text"] == "Reply 2"
 
 
 # ── Attachment Tests ──────────────────────────────────────────────────────
@@ -316,8 +320,8 @@ class TestAttachmentDownload:
         exporter.run()
 
         store, _, _ = s3_env
-        messages = store.download_json(f"slack/{CHANNEL}/messages.json")
-        assert messages[0]["files"][0]["_local_file"] == "attachments/F0REF_data.csv"
+        msg = store.download_json(f"slack/{CHANNEL}/messages/1700000001.000000.json")
+        assert msg["files"][0]["_local_file"] == "attachments/F0REF_data.csv"
 
 
 # ── Checkpoint Tests ──────────────────────────────────────────────────────
@@ -383,7 +387,8 @@ class TestFullExport:
         keys = {obj["Key"] for obj in resp.get("Contents", [])}
         expected = {
             f"slack/{CHANNEL}/channel_info.json",
-            f"slack/{CHANNEL}/messages.json",
+            f"slack/{CHANNEL}/messages/1700000001.000000.json",
+            f"slack/{CHANNEL}/messages/_index.json",
             f"slack/{CHANNEL}/attachments/F0FULL_doc.txt",
         }
         assert expected.issubset(keys)
