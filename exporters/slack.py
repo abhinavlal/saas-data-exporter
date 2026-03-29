@@ -403,7 +403,8 @@ def main():
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
     parser.add_argument("--parallel", type=int, default=env_int("SLACK_PARALLEL", 1),
                         help="Channels to export in parallel (default 1, all share one bot token)")
-    parser.add_argument("--max-workers", type=int, default=env_int("SLACK_MAX_WORKERS", env_int("MAX_WORKERS", 3)))
+    parser.add_argument("--max-workers", type=int, default=env_int("SLACK_MAX_WORKERS", 10),
+                        help="Parallel attachment downloads per channel (default 10, CDN URLs not rate-limited)")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
     args = parser.parse_args()
