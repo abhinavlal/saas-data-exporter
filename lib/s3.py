@@ -129,6 +129,20 @@ class S3Store:
         except ClientError:
             return False
 
+    def list_keys(self, prefix: str = "") -> list[str]:
+        """List all object keys under *prefix* (relative to store prefix)."""
+        full_prefix = self._key(prefix)
+        keys = []
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=full_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                # Strip store prefix to return relative paths
+                if self.prefix and key.startswith(self.prefix + "/"):
+                    key = key[len(self.prefix) + 1:]
+                keys.append(key)
+        return keys
+
     def upload_stream(self, stream: io.IOBase, s3_path: str,
                       content_type: str = "application/octet-stream") -> None:
         self._client.upload_fileobj(

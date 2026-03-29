@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lib.s3 import S3Store
@@ -572,6 +573,7 @@ def main():
                         help="Parallel PR/commit detail fetches per repo (default 10, throttled by TokenBucket)")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
+    parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"), help="Directory for log files")
     args = parser.parse_args()
 
     if not args.token:
@@ -597,7 +599,8 @@ def main():
     if not repos:
         parser.error("--repo or --input-csv is required (or set GITHUB_REPOS)")
 
-    setup_logging(level=args.log_level, json_output=not args.no_json_logs)
+    log_file = os.path.join(args.log_dir, "github.log")
+    setup_logging(level=args.log_level, json_output=not args.no_json_logs, log_file=log_file)
     s3 = S3Store(bucket=args.s3_bucket, prefix=args.s3_prefix)
     config = ExportConfig(
         s3_bucket=args.s3_bucket,

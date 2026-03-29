@@ -5,6 +5,7 @@ import base64
 import email
 import io
 import logging
+import os
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -523,6 +524,7 @@ def main():
                         help="Parallel uploads per user (default 5, conservative since 50 users run in parallel)")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
+    parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"), help="Directory for log files")
     args = parser.parse_args()
 
     if not args.key:
@@ -539,7 +541,8 @@ def main():
     if not users:
         parser.error("--user or --input-csv is required (or set GOOGLE_USERS)")
 
-    setup_logging(level=args.log_level, json_output=not args.no_json_logs)
+    log_file = os.path.join(args.log_dir, "google_workspace.log")
+    setup_logging(level=args.log_level, json_output=not args.no_json_logs, log_file=log_file)
     s3 = S3Store(bucket=args.s3_bucket, prefix=args.s3_prefix)
     config = ExportConfig(
         s3_bucket=args.s3_bucket,
