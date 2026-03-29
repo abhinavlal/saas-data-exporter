@@ -138,8 +138,9 @@ class CheckpointManager:
     def mark_item_done(self, phase: str, item_id) -> None:
         if phase not in self.phases:
             self.phases[phase] = PhaseState(status="in_progress")
-        self.phases[phase].completed_ids.add(item_id)
-        self.phases[phase].completed += 1
+        if item_id not in self.phases[phase].completed_ids:
+            self.phases[phase].completed_ids.add(item_id)
+            self.phases[phase].completed += 1
 
     def set_cursor(self, phase: str, cursor: str | None) -> None:
         if phase not in self.phases:

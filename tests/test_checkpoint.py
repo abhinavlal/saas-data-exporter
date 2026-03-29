@@ -153,3 +153,17 @@ class TestResume:
         assert cp2.phases["items"].completed == 3
         remaining = [i for i in range(5) if not cp2.is_item_done("items", i)]
         assert remaining == [3, 4]
+
+
+class TestMarkItemDoneDedup:
+    def test_duplicate_mark_does_not_double_count(self, s3_store):
+        """Marking the same item done twice should only increment completed once."""
+        cp = CheckpointManager(s3_store, "test/dedup")
+        cp.load()
+        cp.start_phase("items")
+        cp.mark_item_done("items", "id1")
+        cp.mark_item_done("items", "id1")  # duplicate
+        cp.mark_item_done("items", "id2")
+
+        assert cp.phases["items"].completed == 2
+        assert cp.phases["items"].completed_ids == {"id1", "id2"}

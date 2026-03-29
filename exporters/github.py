@@ -6,7 +6,7 @@ import io
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store
+from lib.s3 import S3Store, NDJSONWriter
 from lib.checkpoint import CheckpointManager
 from lib.session import make_session
 from lib.logging import setup_logging
@@ -24,11 +24,12 @@ class GitHubExporter:
         repo: str,
         s3: S3Store,
         config: ExportConfig,
-        pr_limit: int = 500,
-        commit_limit: int = 1000,
+        pr_limit: int = 0,
+        commit_limit: int = 0,
         pr_state: str = "all",
-        skip_commits: bool = False,
+        skip_commits: bool = True,
         skip_prs: bool = False,
+        commit_details: bool = False,
     ):
         self.repo = repo
         self.s3 = s3
@@ -38,6 +39,7 @@ class GitHubExporter:
         self.pr_state = pr_state
         self.skip_commits = skip_commits
         self.skip_prs = skip_prs
+        self.commit_details = commit_details
 
         self.session, self.rate_state = make_session(
             requests_per_second=10,
@@ -149,47 +151,52 @@ class GitHubExporter:
     # ── Commits ───────────────────────────────────────────────────────────
 
     def _export_commits(self):
-        log.info("Exporting commits (limit=%d)", self.commit_limit)
-        self.checkpoint.start_phase("commits", total=self.commit_limit)
+        log.info("Exporting commits (limit=%s, details=%s)",
+                 self.commit_limit or "all", self.commit_details)
+        self.checkpoint.start_phase("commits", total=self.commit_limit or None)
 
-        # Step 1: paginate commit list to get SHAs
-        shas = self._list_commit_shas()
-        log.info("Found %d commit SHAs", len(shas))
+        # Step 1: paginate commit list (list API returns basic info per commit)
+        commits = self._list_commits()
+        log.info("Fetched %d commits from list API", len(commits))
 
-        # Step 2: fetch full details in parallel
-        commits = []
-        to_fetch = [sha for sha in shas if not self.checkpoint.is_item_done("commits", sha)]
-        log.info("Fetching details for %d commits (%d already done)",
-                 len(to_fetch), len(shas) - len(to_fetch))
+        # Step 2: optionally fetch full details (stats, file changes, patches)
+        # This costs 1 API call per commit — only use for small repos
+        if self.commit_details:
+            to_fetch = [c["sha"] for c in commits
+                        if not self.checkpoint.is_item_done("commits", c["sha"])]
+            log.info("Fetching full details for %d commits (%d already done)",
+                     len(to_fetch), len(commits) - len(to_fetch))
 
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {pool.submit(self._fetch_commit_detail, sha): sha for sha in to_fetch}
-            for future in as_completed(futures):
-                sha = futures[future]
-                try:
-                    commit = future.result()
-                    if commit:
-                        commits.append(commit)
-                    self.checkpoint.mark_item_done("commits", sha)
-                    self.checkpoint.save()
-                except Exception:
-                    log.error("Failed to fetch commit %s", sha, exc_info=True)
-
-        # Also include previously completed commits if resuming
-        # (they were already uploaded in prior run — re-fetch for final JSON)
-        # For simplicity, we re-fetch all. Checkpoint prevents duplicate API calls.
-        # Sort by date descending
-        commits.sort(key=lambda c: c.get("author_date", ""), reverse=True)
+            writer = NDJSONWriter(self.s3, f"{self.s3_base}/_commits_wip.json")
+            try:
+                with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+                    futures = {pool.submit(self._fetch_commit_detail, sha): sha for sha in to_fetch}
+                    for future in as_completed(futures):
+                        sha = futures[future]
+                        try:
+                            commit = future.result()
+                            if commit:
+                                writer.append(commit)
+                            self.checkpoint.mark_item_done("commits", sha)
+                            self.checkpoint.save()
+                        except Exception:
+                            log.error("Failed to fetch commit %s", sha, exc_info=True)
+                # Read back, sort, and upload final JSON
+                commits = writer.read_all()
+                commits.sort(key=lambda c: c.get("author_date", ""), reverse=True)
+            finally:
+                writer.close()
 
         self.s3.upload_json(commits, f"{self.s3_base}/commits.json")
         self.checkpoint.complete_phase("commits")
         self.checkpoint.save(force=True)
         log.info("Exported %d commits", len(commits))
 
-    def _list_commit_shas(self) -> list[str]:
-        shas = []
+    def _list_commits(self) -> list[dict]:
+        """Paginate the commit list API. Returns basic commit data (no file stats)."""
+        commits = []
         page = 1
-        while len(shas) < self.commit_limit:
+        while True:
             resp = self.session.get(
                 f"{API_BASE}/repos/{self.repo}/commits",
                 params={"per_page": 100, "page": page},
@@ -199,11 +206,29 @@ class GitHubExporter:
             if not batch:
                 break
             for c in batch:
-                shas.append(c["sha"])
-                if len(shas) >= self.commit_limit:
-                    break
+                commit_obj = c.get("commit", {})
+                author = commit_obj.get("author", {})
+                committer = commit_obj.get("committer", {})
+                commits.append({
+                    "sha": c.get("sha"),
+                    "message": commit_obj.get("message"),
+                    "author_name": author.get("name"),
+                    "author_email": author.get("email"),
+                    "author_login": (c.get("author") or {}).get("login"),
+                    "author_date": author.get("date"),
+                    "committer_name": committer.get("name"),
+                    "committer_email": committer.get("email"),
+                    "committer_login": (c.get("committer") or {}).get("login"),
+                    "committer_date": committer.get("date"),
+                    "parents": [p["sha"] for p in c.get("parents", [])],
+                    "html_url": c.get("html_url"),
+                })
+                if self.commit_limit and len(commits) >= self.commit_limit:
+                    return commits
+            if len(commits) % 1000 == 0:
+                log.info("Listed %d commits so far...", len(commits))
             page += 1
-        return shas
+        return commits
 
     def _fetch_commit_detail(self, sha: str) -> dict | None:
         resp = self.session.get(f"{API_BASE}/repos/{self.repo}/commits/{sha}")
@@ -252,34 +277,39 @@ class GitHubExporter:
     # ── Pull Requests ─────────────────────────────────────────────────────
 
     def _export_pull_requests(self):
-        log.info("Exporting pull requests (limit=%d, state=%s)", self.pr_limit, self.pr_state)
-        self.checkpoint.start_phase("pull_requests", total=self.pr_limit)
+        log.info("Exporting pull requests (limit=%s, state=%s)", self.pr_limit or "all", self.pr_state)
+        self.checkpoint.start_phase("pull_requests", total=self.pr_limit or None)
 
         # Step 1: paginate PR list
         pr_numbers = self._list_pr_numbers()
         log.info("Found %d PRs", len(pr_numbers))
 
-        # Step 2: fetch full details in parallel
-        prs = []
+        # Step 2: fetch full details in parallel, writing to disk to avoid memory buildup
         to_fetch = [n for n in pr_numbers if not self.checkpoint.is_item_done("pull_requests", n)]
         log.info("Fetching details for %d PRs (%d already done)",
                  len(to_fetch), len(pr_numbers) - len(to_fetch))
 
-        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-            futures = {pool.submit(self._fetch_pr_detail, n): n for n in to_fetch}
-            for future in as_completed(futures):
-                number = futures[future]
-                try:
-                    pr = future.result()
-                    if pr:
-                        prs.append(pr)
-                    self.checkpoint.mark_item_done("pull_requests", number)
-                    self.checkpoint.save()
-                except Exception:
-                    log.error("Failed to fetch PR #%d", number, exc_info=True)
+        writer = NDJSONWriter(self.s3, f"{self.s3_base}/_prs_wip.json")
+        try:
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+                futures = {pool.submit(self._fetch_pr_detail, n): n for n in to_fetch}
+                for future in as_completed(futures):
+                    number = futures[future]
+                    try:
+                        pr = future.result()
+                        if pr:
+                            writer.append(pr)
+                        self.checkpoint.mark_item_done("pull_requests", number)
+                        self.checkpoint.save()
+                    except Exception:
+                        log.error("Failed to fetch PR #%d", number, exc_info=True)
+
+            # Read back from disk for sort + final JSON + CSV upload
+            prs = writer.read_all()
+        finally:
+            writer.close()
 
         prs.sort(key=lambda p: p.get("number", 0), reverse=True)
-
         self.s3.upload_json(prs, f"{self.s3_base}/pull_requests.json")
         self._upload_pr_csv(prs)
         self.checkpoint.complete_phase("pull_requests")
@@ -289,7 +319,7 @@ class GitHubExporter:
     def _list_pr_numbers(self) -> list[int]:
         numbers = []
         page = 1
-        while len(numbers) < self.pr_limit:
+        while True:
             resp = self.session.get(
                 f"{API_BASE}/repos/{self.repo}/pulls",
                 params={
@@ -306,8 +336,8 @@ class GitHubExporter:
                 break
             for pr in batch:
                 numbers.append(pr["number"])
-                if len(numbers) >= self.pr_limit:
-                    break
+                if self.pr_limit and len(numbers) >= self.pr_limit:
+                    return numbers
             page += 1
         return numbers
 
@@ -511,11 +541,15 @@ def main():
     parser.add_argument("--input-csv", default=env("GITHUB_INPUT_CSV"), help="CSV file with 'repo' column")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
-    parser.add_argument("--pr-limit", type=int, default=env_int("GITHUB_PR_LIMIT", 500))
+    parser.add_argument("--pr-limit", type=int, default=env_int("GITHUB_PR_LIMIT", 0), help="Max PRs (0=all)")
     parser.add_argument("--pr-state", default=env("GITHUB_PR_STATE", "all"), choices=["open", "closed", "all"])
-    parser.add_argument("--commit-limit", type=int, default=env_int("GITHUB_COMMIT_LIMIT", 1000))
-    parser.add_argument("--skip-commits", action="store_true", default=env_bool("GITHUB_SKIP_COMMITS"))
+    parser.add_argument("--commit-limit", type=int, default=env_int("GITHUB_COMMIT_LIMIT", 0), help="Max commits (0=all)")
+    parser.add_argument("--skip-commits", action="store_true", default=env_bool("GITHUB_SKIP_COMMITS", True))
+    parser.add_argument("--include-commits", action="store_true", default=env_bool("GITHUB_INCLUDE_COMMITS"),
+                        help="Include commit export (off by default)")
     parser.add_argument("--skip-prs", action="store_true", default=env_bool("GITHUB_SKIP_PRS"))
+    parser.add_argument("--commit-details", action="store_true", default=env_bool("GITHUB_COMMIT_DETAILS"),
+                        help="Fetch full commit details (stats, files, patches) — 1 API call per commit")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
@@ -525,6 +559,10 @@ def main():
         parser.error("--token is required (or set GITHUB_TOKEN)")
     if not args.s3_bucket:
         parser.error("--s3-bucket is required (or set S3_BUCKET)")
+
+    # --include-commits overrides --skip-commits
+    if args.include_commits:
+        args.skip_commits = False
 
     # Resolve repo list: CLI > CSV > env var
     repos = args.repo
@@ -543,20 +581,28 @@ def main():
         max_workers=args.max_workers,
         log_level=args.log_level,
     )
-    for repo in repos:
-        log.info("Exporting repo %s (%d of %d)", repo, repos.index(repo) + 1, len(repos))
-        exporter = GitHubExporter(
-            token=args.token,
-            repo=repo,
-            s3=s3,
-            config=config,
-            pr_limit=args.pr_limit,
-            commit_limit=args.commit_limit,
-            pr_state=args.pr_state,
-            skip_commits=args.skip_commits,
-            skip_prs=args.skip_prs,
-        )
-        exporter.run()
+    failed = []
+    for i, repo in enumerate(repos, 1):
+        log.info("Exporting repo %s (%d of %d)", repo, i, len(repos))
+        try:
+            exporter = GitHubExporter(
+                token=args.token,
+                repo=repo,
+                s3=s3,
+                config=config,
+                pr_limit=args.pr_limit,
+                commit_limit=args.commit_limit,
+                pr_state=args.pr_state,
+                skip_commits=args.skip_commits,
+                skip_prs=args.skip_prs,
+                commit_details=args.commit_details,
+            )
+            exporter.run()
+        except Exception:
+            log.error("Export failed for repo %s, continuing with next", repo, exc_info=True)
+            failed.append(repo)
+    if failed:
+        log.error("Failed repos (%d/%d): %s", len(failed), len(repos), ", ".join(failed))
 
 
 if __name__ == "__main__":

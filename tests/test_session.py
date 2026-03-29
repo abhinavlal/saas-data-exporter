@@ -57,7 +57,20 @@ class TestRateLimitState:
         })
         wait = state.should_preemptive_wait(min_remaining=50)
         assert wait is not None
-        assert 50 < wait < 70  # ~61 seconds
+        # 60s remaining / 10 requests = ~6s per request
+        assert 4 < wait < 8
+
+    def test_preemptive_wait_full_reset_when_exhausted(self):
+        state = RateLimitState()
+        reset_time = time.time() + 60
+        state.update({
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Limit": "5000",
+            "X-RateLimit-Reset": str(reset_time),
+        })
+        wait = state.should_preemptive_wait(min_remaining=50)
+        assert wait is not None
+        assert 50 < wait < 70  # full reset wait
 
 
 class TestMakeSession:

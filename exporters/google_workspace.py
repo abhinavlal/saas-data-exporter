@@ -65,9 +65,9 @@ class GoogleWorkspaceExporter:
         service_account_key: str,
         s3: S3Store,
         config: ExportConfig,
-        email_limit: int = 500,
-        event_limit: int = 500,
-        file_limit: int = 50,
+        email_limit: int = 0,
+        event_limit: int = 0,
+        file_limit: int = 0,
         skip_gmail: bool = False,
         skip_calendar: bool = False,
         skip_drive: bool = False,
@@ -114,8 +114,8 @@ class GoogleWorkspaceExporter:
     # ── Gmail ─────────────────────────────────────────────────────────────
 
     def _export_gmail(self):
-        log.info("Exporting Gmail for %s (limit=%d)", self.user, self.email_limit)
-        self.checkpoint.start_phase("gmail", total=self.email_limit)
+        log.info("Exporting Gmail for %s (limit=%s)", self.user, self.email_limit or "all")
+        self.checkpoint.start_phase("gmail", total=self.email_limit or None)
         service = self._build_service("gmail", "v1")
 
         # Step 1: list message IDs
@@ -166,16 +166,21 @@ class GoogleWorkspaceExporter:
     def _list_gmail_ids(self, service) -> list[str]:
         ids = []
         page_token = None
-        while len(ids) < self.email_limit:
+        while True:
+            batch_size = 100
+            if self.email_limit:
+                batch_size = min(100, self.email_limit - len(ids))
+                if batch_size <= 0:
+                    break
             resp = service.users().messages().list(
                 userId="me",
-                maxResults=min(100, self.email_limit - len(ids)),
+                maxResults=batch_size,
                 pageToken=page_token,
             ).execute()
             for msg in resp.get("messages", []):
                 ids.append(msg["id"])
-                if len(ids) >= self.email_limit:
-                    break
+                if self.email_limit and len(ids) >= self.email_limit:
+                    return ids
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
@@ -250,20 +255,25 @@ class GoogleWorkspaceExporter:
     # ── Calendar ──────────────────────────────────────────────────────────
 
     def _export_calendar(self):
-        log.info("Exporting Calendar for %s (limit=%d)", self.user, self.event_limit)
-        self.checkpoint.start_phase("calendar", total=self.event_limit)
+        log.info("Exporting Calendar for %s (limit=%s)", self.user, self.event_limit or "all")
+        self.checkpoint.start_phase("calendar", total=self.event_limit or None)
         service = self._build_service("calendar", "v3")
 
         time_min = (datetime.now(timezone.utc) - timedelta(days=730)).isoformat()
         events = []
         page_token = None
 
-        while len(events) < self.event_limit:
+        while True:
+            batch_size = 250
+            if self.event_limit:
+                batch_size = min(250, self.event_limit - len(events))
+                if batch_size <= 0:
+                    break
             try:
                 resp = service.events().list(
                     calendarId="primary",
                     timeMin=time_min,
-                    maxResults=min(250, self.event_limit - len(events)),
+                    maxResults=batch_size,
                     singleEvents=True,
                     orderBy="startTime",
                     pageToken=page_token,
@@ -274,7 +284,7 @@ class GoogleWorkspaceExporter:
 
             for event in resp.get("items", []):
                 events.append(event)
-                if len(events) >= self.event_limit:
+                if self.event_limit and len(events) >= self.event_limit:
                     break
 
             page_token = resp.get("nextPageToken")
@@ -308,8 +318,8 @@ class GoogleWorkspaceExporter:
     # ── Drive ─────────────────────────────────────────────────────────────
 
     def _export_drive(self):
-        log.info("Exporting Drive for %s (limit=%d)", self.user, self.file_limit)
-        self.checkpoint.start_phase("drive", total=self.file_limit)
+        log.info("Exporting Drive for %s (limit=%s)", self.user, self.file_limit or "all")
+        self.checkpoint.start_phase("drive", total=self.file_limit or None)
         service = self._build_service("drive", "v3")
 
         # List files
@@ -354,11 +364,16 @@ class GoogleWorkspaceExporter:
     def _list_drive_files(self, service) -> list[dict]:
         files = []
         page_token = None
-        while len(files) < self.file_limit:
+        while True:
+            batch_size = 100
+            if self.file_limit:
+                batch_size = min(100, self.file_limit - len(files))
+                if batch_size <= 0:
+                    break
             try:
                 resp = service.files().list(
                     q=f"'{self.user}' in owners",
-                    pageSize=min(100, self.file_limit - len(files)),
+                    pageSize=batch_size,
                     orderBy="modifiedTime desc",
                     fields="nextPageToken, files(id, name, mimeType, size, owners, modifiedTime)",
                     pageToken=page_token,
@@ -369,8 +384,8 @@ class GoogleWorkspaceExporter:
 
             for f in resp.get("files", []):
                 files.append(f)
-                if len(files) >= self.file_limit:
-                    break
+                if self.file_limit and len(files) >= self.file_limit:
+                    return files
 
             page_token = resp.get("nextPageToken")
             if not page_token:
@@ -440,9 +455,9 @@ def main():
     parser.add_argument("--key", default=env("GOOGLE_SERVICE_ACCOUNT_KEY"), help="Service account JSON key file")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
-    parser.add_argument("--emails", type=int, default=env_int("GOOGLE_EMAIL_LIMIT", 500))
-    parser.add_argument("--events", type=int, default=env_int("GOOGLE_EVENT_LIMIT", 500))
-    parser.add_argument("--files", type=int, default=env_int("GOOGLE_FILE_LIMIT", 50))
+    parser.add_argument("--emails", type=int, default=env_int("GOOGLE_EMAIL_LIMIT", 0), help="Max emails (0=all)")
+    parser.add_argument("--events", type=int, default=env_int("GOOGLE_EVENT_LIMIT", 0), help="Max events (0=all)")
+    parser.add_argument("--files", type=int, default=env_int("GOOGLE_FILE_LIMIT", 0), help="Max Drive files (0=all)")
     parser.add_argument("--skip-gmail", action="store_true", default=env_bool("GOOGLE_SKIP_GMAIL"))
     parser.add_argument("--skip-calendar", action="store_true", default=env_bool("GOOGLE_SKIP_CALENDAR"))
     parser.add_argument("--skip-drive", action="store_true", default=env_bool("GOOGLE_SKIP_DRIVE"))
@@ -473,21 +488,28 @@ def main():
         max_workers=args.max_workers,
         log_level=args.log_level,
     )
-    for user in users:
-        log.info("Exporting user %s (%d of %d)", user, users.index(user) + 1, len(users))
-        exporter = GoogleWorkspaceExporter(
-            user=user,
-            service_account_key=args.key,
-            s3=s3,
-            config=config,
-            email_limit=args.emails,
-            event_limit=args.events,
-            file_limit=args.files,
-            skip_gmail=args.skip_gmail,
-            skip_calendar=args.skip_calendar,
-            skip_drive=args.skip_drive,
-        )
-        exporter.run()
+    failed = []
+    for i, user in enumerate(users, 1):
+        log.info("Exporting user %s (%d of %d)", user, i, len(users))
+        try:
+            exporter = GoogleWorkspaceExporter(
+                user=user,
+                service_account_key=args.key,
+                s3=s3,
+                config=config,
+                email_limit=args.emails,
+                event_limit=args.events,
+                file_limit=args.files,
+                skip_gmail=args.skip_gmail,
+                skip_calendar=args.skip_calendar,
+                skip_drive=args.skip_drive,
+            )
+            exporter.run()
+        except Exception:
+            log.error("Export failed for user %s, continuing with next", user, exc_info=True)
+            failed.append(user)
+    if failed:
+        log.error("Failed users (%d/%d): %s", len(failed), len(users), ", ".join(failed))
 
 
 if __name__ == "__main__":

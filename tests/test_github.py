@@ -90,9 +90,25 @@ def mock_contributors_api():
     )
 
 
+def _commit_list_item(i):
+    """A commit as returned by the list API (no stats/files)."""
+    return {
+        "sha": f"sha{i}",
+        "commit": {
+            "message": f"Commit message {i}",
+            "author": {"name": "Alice", "email": "alice@test.com", "date": f"2024-06-0{i+1}T00:00:00Z"},
+            "committer": {"name": "Alice", "email": "alice@test.com", "date": f"2024-06-0{i+1}T00:00:00Z"},
+        },
+        "author": {"login": "alice"},
+        "committer": {"login": "alice"},
+        "parents": [{"sha": f"parent{i}"}],
+        "html_url": f"https://github.com/{REPO}/commit/sha{i}",
+    }
+
+
 def mock_commits_api(count=3):
     """Mock commit list + individual detail endpoints."""
-    commit_list = [{"sha": f"sha{i}"} for i in range(count)]
+    commit_list = [_commit_list_item(i) for i in range(count)]
     responses.add(
         responses.GET, f"{API}/repos/{REPO}/commits",
         json=commit_list,
@@ -104,25 +120,16 @@ def mock_commits_api(count=3):
         json=[],
         status=200,
     )
-    # Individual commit details
+    # Individual commit details (only used when commit_details=True)
     for i in range(count):
         responses.add(
             responses.GET, f"{API}/repos/{REPO}/commits/sha{i}",
             json={
-                "sha": f"sha{i}",
-                "commit": {
-                    "message": f"Commit message {i}",
-                    "author": {"name": "Alice", "email": "alice@test.com", "date": f"2024-06-0{i+1}T00:00:00Z"},
-                    "committer": {"name": "Alice", "email": "alice@test.com", "date": f"2024-06-0{i+1}T00:00:00Z"},
-                },
-                "author": {"login": "alice"},
-                "committer": {"login": "alice"},
-                "parents": [{"sha": f"parent{i}"}],
+                **_commit_list_item(i),
                 "stats": {"additions": 10, "deletions": 2, "total": 12},
                 "files": [
                     {"filename": f"file{i}.py", "status": "modified", "additions": 10, "deletions": 2, "patch": "@@ -1 +1 @@"},
                 ],
-                "html_url": f"https://github.com/{REPO}/commit/sha{i}",
             },
             status=200,
         )
@@ -240,7 +247,7 @@ class TestContributorsExport:
 
 class TestCommitsExport:
     @responses.activate
-    def test_exports_commits_with_details(self, s3_env):
+    def test_exports_commits_from_list_api(self, s3_env):
         mock_repo_api()
         mock_contributors_api()
         mock_commits_api(count=3)
@@ -254,6 +261,21 @@ class TestCommitsExport:
         assert "sha" in c
         assert c["author_name"] == "Alice"
         assert c["author_login"] == "alice"
+        # No stats/files from list API (only with --commit-details)
+        assert "stats" not in c
+
+    @responses.activate
+    def test_exports_commits_with_details_flag(self, s3_env):
+        mock_repo_api()
+        mock_contributors_api()
+        mock_commits_api(count=3)
+        exporter = _make_exporter(s3_env, skip_commits=False, commit_limit=5, commit_details=True)
+        exporter.run()
+
+        store, _, _ = s3_env
+        commits = store.download_json(f"github/{SLUG}/commits.json")
+        assert len(commits) == 3
+        c = commits[0]
         assert c["stats"]["additions"] == 10
         assert len(c["files"]) == 1
 
@@ -313,8 +335,8 @@ class TestCheckpointResume:
         assert len(responses.calls) == call_count_before
 
     @responses.activate
-    def test_resume_commits_after_partial(self, s3_env):
-        """Simulate partial commit export, then resume."""
+    def test_resume_commit_details_after_partial(self, s3_env):
+        """Simulate partial commit detail fetch, then resume."""
         store, config, _ = s3_env
 
         # Pre-populate checkpoint: metadata+contributors done, commits partially done
@@ -330,10 +352,9 @@ class TestCheckpointResume:
         cp.save(force=True)
 
         # Mock APIs — metadata/contributors not needed (checkpointed)
-        # Only commit list + details for sha1, sha2 (sha0 already done)
         mock_commits_api(count=3)
 
-        exporter = _make_exporter(s3_env, skip_commits=False, commit_limit=5)
+        exporter = _make_exporter(s3_env, skip_commits=False, commit_limit=5, commit_details=True)
         exporter.run()
 
         commits = store.download_json(f"github/{SLUG}/commits.json")
