@@ -1,13 +1,11 @@
 """Jira Project Exporter — exports tickets, comments, attachments, and changelogs to S3."""
 
 import argparse
-import csv
-import io
 import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store
+from lib.s3 import S3Store, sanitize_filename
 from lib.checkpoint import CheckpointManager
 from lib.stats import StatsCollector
 from lib.session import make_session
@@ -88,6 +86,9 @@ class JiraExporter:
         self._field_map: dict[str, str] | None = None
 
     def run(self):
+        # Resolve custom field names once before parallel dispatch (avoids race)
+        if self._field_map is None:
+            self._field_map = self._resolve_custom_fields()
         failed = []
         log.info("Exporting %d projects (%d in parallel)", len(self.projects), self.parallel)
         with ThreadPoolExecutor(max_workers=self.parallel) as pool:
@@ -112,10 +113,6 @@ class JiraExporter:
         stats.load()
         stats.set("exporter", "jira")
         stats.set("target", project_key)
-
-        # Resolve custom field names
-        if self._field_map is None:
-            self._field_map = self._resolve_custom_fields()
 
         # Step 1: search tickets — writes each ticket to tickets/{key}.json
         if not checkpoint.is_phase_done("tickets"):
@@ -154,9 +151,6 @@ class JiraExporter:
             checkpoint.complete_phase("attachments")
             checkpoint.save(force=True)
 
-        # Step 4: generate CSV — one ticket at a time
-        self._upload_csv(ticket_keys, index.get("custom_fields", []), s3_base)
-
         from datetime import datetime, timezone
         stats.set("exported_at", datetime.now(timezone.utc).isoformat())
         stats.save(force=True)
@@ -173,8 +167,10 @@ class JiraExporter:
         jql = f"project = {project_key} ORDER BY created DESC"
         next_page_token = checkpoint.get_cursor("tickets")
         ticket_count = 0
-        keys: list[str] = []
-        custom_fields: set[str] = set()
+        # Resume: load existing index to preserve pre-crash keys
+        existing_index = self.s3.download_json(f"{s3_base}/tickets/_index.json")
+        keys: list[str] = existing_index["keys"] if existing_index else []
+        custom_fields: set[str] = set(existing_index.get("custom_fields", [])) if existing_index else set()
 
         while True:
             batch_size = 100
@@ -424,7 +420,7 @@ class JiraExporter:
                 if checkpoint.is_item_done("attachments", ck_id):
                     continue
                 filename = att.get("filename", "unknown")
-                s3_path = f"{s3_base}/attachments/{key}/{filename}"
+                s3_path = f"{s3_base}/attachments/{key}/{sanitize_filename(filename)}"
                 downloads.append((ck_id, url, s3_path, filename))
 
         log.info("Downloading %d attachments", len(downloads))
@@ -450,60 +446,6 @@ class JiraExporter:
             tmp.flush()
             self.s3.upload_file(tmp.name, s3_path)
 
-    # ── CSV ───────────────────────────────────────────────────────────────
-
-    def _upload_csv(self, ticket_keys: list[str], custom_fields: list[str],
-                    s3_base: str) -> None:
-        """Generate CSV by loading one ticket at a time from S3."""
-        if not ticket_keys:
-            self.s3.upload_bytes(b"", f"{s3_base}/tickets.csv", "text/csv")
-            return
-
-        base_fields = [
-            "key", "summary", "issue_type", "status", "status_category", "priority",
-            "resolution", "project_key", "created", "updated", "resolved", "due_date",
-            "assignee", "assignee_email", "reporter", "reporter_email", "creator",
-            "labels", "components", "fix_versions", "sprint", "parent_key",
-            "original_estimate", "remaining_estimate", "time_spent",
-            "votes", "watchers", "comments_text", "attachment_filenames", "changelog_count",
-        ]
-        fieldnames = base_fields + list(custom_fields)
-
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-
-        for key in ticket_keys:
-            ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
-            if not ticket:
-                continue
-
-            comment_parts = []
-            for c in ticket.get("comments", []):
-                comment_parts.append(f"[{c.get('created', '')}] {c.get('author', '')}: {c.get('body_text', '')}")
-            comments_text = "\n---\n".join(comment_parts)
-
-            attachment_filenames = "|".join(a.get("filename", "") for a in ticket.get("attachments", []))
-            changelog_count = len(ticket.get("changelog", []))
-
-            row = {
-                **{k: ticket.get(k) for k in base_fields if k not in ("comments_text", "attachment_filenames", "changelog_count", "labels", "components", "fix_versions")},
-                "labels": "|".join(ticket.get("labels", [])),
-                "components": "|".join(ticket.get("components", [])),
-                "fix_versions": "|".join(ticket.get("fix_versions", [])),
-                "comments_text": comments_text,
-                "attachment_filenames": attachment_filenames,
-                "changelog_count": changelog_count,
-            }
-            for cf in custom_fields:
-                row[cf] = ticket.get(cf, "")
-            writer.writerow(row)
-
-        self.s3.upload_bytes(
-            output.getvalue().encode("utf-8"),
-            f"{s3_base}/tickets.csv",
-            content_type="text/csv",
-        )
 
 
 def main():

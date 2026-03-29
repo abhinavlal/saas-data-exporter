@@ -5,7 +5,7 @@ import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lib.s3 import S3Store
+from lib.s3 import S3Store, sanitize_filename
 from lib.checkpoint import CheckpointManager
 from lib.stats import StatsCollector
 from lib.session import make_session
@@ -153,7 +153,8 @@ class SlackExporter:
                         stats: StatsCollector) -> None:
         """Fetch messages and write each to messages/{ts}.json. Builds _index.json."""
         checkpoint.start_phase("messages")
-        ts_list: list[str] = []
+        # Resume: load existing index to preserve pre-crash message timestamps
+        ts_list: list[str] = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
         cursor = checkpoint.get_cursor("messages")
         params = {"channel": channel_id, "limit": 200}
         if cursor:
@@ -304,7 +305,7 @@ class SlackExporter:
                 url = file_obj.get("url_private_download") or file_obj.get("url_private")
                 if not url:
                     continue
-                s3_filename = f"{file_id}_{name}"
+                s3_filename = f"{file_id}_{sanitize_filename(name)}"
                 s3_path = f"{s3_base}/attachments/{s3_filename}"
                 downloads.append((file_id, url, s3_path, s3_filename, ts))
 

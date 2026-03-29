@@ -15,7 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-from lib.s3 import S3Store
+from lib.s3 import S3Store, sanitize_filename
 from lib.checkpoint import CheckpointManager
 from lib.stats import StatsCollector
 from lib.retry import retry
@@ -253,7 +253,7 @@ class GoogleWorkspaceExporter:
                 continue
             self.s3.upload_bytes(
                 payload,
-                f"{self.s3_base}/gmail/attachments/{msg_id}/{filename}",
+                f"{self.s3_base}/gmail/attachments/{msg_id}/{sanitize_filename(filename)}",
             )
 
     def _build_index_entry(self, msg_id: str, msg_data: dict) -> dict:
@@ -288,6 +288,7 @@ class GoogleWorkspaceExporter:
         event_count = 0
         event_ids: list[str] = []
         page_token = None
+        had_error = False
 
         while True:
             batch_size = 250
@@ -307,6 +308,7 @@ class GoogleWorkspaceExporter:
                 ).execute()
             except HttpError as e:
                 log.error("Calendar API error: %s", e)
+                had_error = True
                 break
 
             for event in resp.get("items", []):
@@ -338,7 +340,10 @@ class GoogleWorkspaceExporter:
         self.s3.upload_json(event_ids, f"{self.s3_base}/calendar/_index.json")
 
         self.stats.save(force=True)
-        self.checkpoint.complete_phase("calendar")
+        if had_error:
+            log.warning("Calendar export incomplete due to errors — will retry on next run")
+        else:
+            self.checkpoint.complete_phase("calendar")
         self.checkpoint.save(force=True)
         log.info("Exported %d calendar events", event_count)
 
@@ -448,13 +453,14 @@ class GoogleWorkspaceExporter:
 
         request = service.files().export_media(fileId=file_meta["id"], mimeType=export_mime)
         request.uri += f"&quotaUser={self.user}"
+        safe_name = f"{file_meta['id']}_{sanitize_filename(name)}"
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
             downloader = MediaIoBaseDownload(tmp, request)
             done = False
             while not done:
                 _, done = downloader.next_chunk()
             tmp.flush()
-            self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{name}")
+            self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{safe_name}")
 
     @retry(max_attempts=3, backoff_base=2.0, exceptions=(HttpError, IOError))
     def _download_drive_file(self, service, file_meta: dict) -> None:
@@ -465,13 +471,14 @@ class GoogleWorkspaceExporter:
 
         request = service.files().get_media(fileId=file_meta["id"])
         request.uri += f"&quotaUser={self.user}"
+        safe_name = f"{file_meta['id']}_{sanitize_filename(name)}"
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
             downloader = MediaIoBaseDownload(tmp, request)
             done = False
             while not done:
                 _, done = downloader.next_chunk()
             tmp.flush()
-            self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{name}")
+            self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{safe_name}")
 
     def _drive_index_entry(self, file_meta: dict, downloaded: bool,
                            reason: str | None = None) -> dict:

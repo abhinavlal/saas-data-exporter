@@ -4,6 +4,7 @@ import json
 import io
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -16,6 +17,28 @@ from botocore.exceptions import ClientError
 log = logging.getLogger(__name__)
 
 MB = 1024 * 1024
+
+# Characters unsafe in S3 keys or that break presigned URLs
+_UNSAFE_CHARS = re.compile(r'[/\\?#\x00-\x1f\x7f]')
+
+
+def sanitize_filename(name: str, max_len: int = 200) -> str:
+    """Sanitize a filename for use in S3 keys.
+
+    - Replaces /, \\, ?, #, and control chars with _
+    - Truncates to max_len while preserving the extension
+    - Returns 'unnamed' if the result would be empty
+    """
+    name = _UNSAFE_CHARS.sub('_', name).strip('. ')
+    if not name:
+        return "unnamed"
+    if len(name) > max_len:
+        stem, _, ext = name.rpartition('.')
+        if ext and len(ext) < 20:
+            name = stem[:max_len - len(ext) - 1] + '.' + ext
+        else:
+            name = name[:max_len]
+    return name
 
 SMALL_FILE_CONFIG = TransferConfig(
     multipart_threshold=128 * MB,

@@ -299,19 +299,6 @@ class TestPullRequestsExport:
         assert len(pr["comments"]) == 1
         assert len(pr["commits"]) == 1
 
-    @responses.activate
-    def test_exports_pr_csv(self, s3_env):
-        mock_repo_api()
-        mock_contributors_api()
-        mock_prs_api(count=1)
-        exporter = _make_exporter(s3_env, skip_prs=False, pr_limit=5)
-        exporter.run()
-
-        store, _, conn = s3_env
-        resp = conn.get_object(Bucket="test-bucket", Key=f"github/{SLUG}/pull_requests.csv")
-        csv_content = resp["Body"].read().decode()
-        assert "number" in csv_content
-        assert "alice" in csv_content
 
 
 class TestCheckpointResume:
@@ -389,7 +376,6 @@ class TestFullExport:
             f"github/{SLUG}/commits/sha0.json",
             f"github/{SLUG}/commits/sha1.json",
             f"github/{SLUG}/prs/1.json",
-            f"github/{SLUG}/pull_requests.csv",
             f"github/{SLUG}/_stats.json",
         }
         assert expected.issubset(keys)
