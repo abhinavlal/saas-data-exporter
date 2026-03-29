@@ -63,8 +63,10 @@ class JiraExporter:
         limit: int = 0,
         skip_attachments: bool = False,
         skip_comments: bool = False,
+        parallel: int = 1,
     ):
         self.projects = projects
+        self.parallel = parallel
         self.s3 = s3
         self.config = config
         self.limit = limit
@@ -84,12 +86,16 @@ class JiraExporter:
 
     def run(self):
         failed = []
-        for project in self.projects:
-            try:
-                self._export_project(project)
-            except Exception:
-                log.error("Export failed for project %s, continuing with next", project, exc_info=True)
-                failed.append(project)
+        log.info("Exporting %d projects (%d in parallel)", len(self.projects), self.parallel)
+        with ThreadPoolExecutor(max_workers=self.parallel) as pool:
+            futures = {pool.submit(self._export_project, p): p for p in self.projects}
+            for future in as_completed(futures):
+                project = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    log.error("Export failed for project %s, continuing with next", project, exc_info=True)
+                    failed.append(project)
         if failed:
             log.error("Failed projects (%d/%d): %s",
                       len(failed), len(self.projects), ", ".join(failed))
@@ -469,6 +475,8 @@ def main():
     parser.add_argument("--limit", type=int, default=env_int("JIRA_LIMIT", 0), help="Max tickets per project (0=all)")
     parser.add_argument("--skip-attachments", action="store_true", default=env_bool("JIRA_SKIP_ATTACHMENTS"))
     parser.add_argument("--skip-comments", action="store_true", default=env_bool("JIRA_SKIP_COMMENTS"))
+    parser.add_argument("--parallel", type=int, default=env_int("JIRA_PARALLEL", 1),
+                        help="Projects to export in parallel (default 1, all share one API token)")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
@@ -506,6 +514,7 @@ def main():
         limit=args.limit,
         skip_attachments=args.skip_attachments,
         skip_comments=args.skip_comments,
+        parallel=args.parallel,
     )
     exporter.run()
 

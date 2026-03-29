@@ -547,6 +547,8 @@ def main():
     parser.add_argument("--skip-prs", action="store_true", default=env_bool("GITHUB_SKIP_PRS"))
     parser.add_argument("--commit-details", action="store_true", default=env_bool("GITHUB_COMMIT_DETAILS"),
                         help="Fetch full commit details (stats, files, patches) — 1 API call per commit")
+    parser.add_argument("--parallel", type=int, default=env_int("GITHUB_PARALLEL", 2),
+                        help="Repos to export in parallel (default 2, all share one PAT rate limit)")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
@@ -578,26 +580,34 @@ def main():
         max_workers=args.max_workers,
         log_level=args.log_level,
     )
+
+    def _export_one_repo(repo: str) -> None:
+        log.info("Exporting repo %s", repo)
+        exporter = GitHubExporter(
+            token=args.token,
+            repo=repo,
+            s3=s3,
+            config=config,
+            pr_limit=args.pr_limit,
+            commit_limit=args.commit_limit,
+            pr_state=args.pr_state,
+            skip_commits=args.skip_commits,
+            skip_prs=args.skip_prs,
+            commit_details=args.commit_details,
+        )
+        exporter.run()
+
     failed = []
-    for i, repo in enumerate(repos, 1):
-        log.info("Exporting repo %s (%d of %d)", repo, i, len(repos))
-        try:
-            exporter = GitHubExporter(
-                token=args.token,
-                repo=repo,
-                s3=s3,
-                config=config,
-                pr_limit=args.pr_limit,
-                commit_limit=args.commit_limit,
-                pr_state=args.pr_state,
-                skip_commits=args.skip_commits,
-                skip_prs=args.skip_prs,
-                commit_details=args.commit_details,
-            )
-            exporter.run()
-        except Exception:
-            log.error("Export failed for repo %s, continuing with next", repo, exc_info=True)
-            failed.append(repo)
+    log.info("Exporting %d repos (%d in parallel)", len(repos), args.parallel)
+    with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+        futures = {pool.submit(_export_one_repo, r): r for r in repos}
+        for future in as_completed(futures):
+            repo = futures[future]
+            try:
+                future.result()
+            except Exception:
+                log.error("Export failed for repo %s, continuing with next", repo, exc_info=True)
+                failed.append(repo)
     if failed:
         log.error("Failed repos (%d/%d): %s", len(failed), len(repos), ", ".join(failed))
 
