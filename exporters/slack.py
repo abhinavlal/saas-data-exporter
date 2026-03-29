@@ -284,16 +284,16 @@ class SlackExporter:
     def _download_attachments_from_index(self, channel_id: str, s3_base: str,
                                         checkpoint: CheckpointManager,
                                         stats: StatsCollector) -> None:
-        """Download attachments by iterating message index — one message at a time."""
+        """Collect all file URLs from messages, download in parallel."""
         checkpoint.start_phase("attachments")
         index = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
-        download_count = 0
 
+        # Collect all downloadable files across all messages
+        downloads = []  # (file_id, url, s3_path, s3_filename, msg_ts)
         for ts in index:
             msg = self.s3.download_json(f"{s3_base}/messages/{ts}.json")
             if not msg or "files" not in msg:
                 continue
-            updated = False
             for file_obj in msg.get("files", []):
                 if _is_skippable_file(file_obj):
                     continue
@@ -306,25 +306,44 @@ class SlackExporter:
                     continue
                 s3_filename = f"{file_id}_{name}"
                 s3_path = f"{s3_base}/attachments/{s3_filename}"
+                downloads.append((file_id, url, s3_path, s3_filename, ts))
+
+        log.info("Downloading %d attachments for channel %s", len(downloads), channel_id)
+
+        # Download in parallel
+        completed_by_msg: dict[str, list[tuple[str, str]]] = {}  # ts -> [(file_id, s3_filename)]
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+            futures = {pool.submit(self._download_one_file, url, s3_path): (fid, s3fn, ts)
+                       for fid, url, s3_path, s3fn, ts in downloads}
+            for future in as_completed(futures):
+                file_id, s3_filename, msg_ts = futures[future]
                 try:
-                    self._download_one_file(url, s3_path)
-                    file_obj["_local_file"] = f"attachments/{s3_filename}"
-                    updated = True
-                    download_count += 1
+                    future.result()
+                    completed_by_msg.setdefault(msg_ts, []).append((file_id, s3_filename))
                     stats.increment("files.downloaded")
                     stats.save()
                     checkpoint.mark_item_done("attachments", file_id)
                     checkpoint.save()
                 except Exception:
                     log.error("Failed to download file %s", file_id, exc_info=True)
-            # Re-upload message with _local_file references
-            if updated:
-                self.s3.upload_json(msg, f"{s3_base}/messages/{ts}.json")
+
+        # Update message files with _local_file references
+        for ts, file_refs in completed_by_msg.items():
+            msg = self.s3.download_json(f"{s3_base}/messages/{ts}.json")
+            if not msg:
+                continue
+            done_ids = {fid for fid, _ in file_refs}
+            s3fn_map = {fid: s3fn for fid, s3fn in file_refs}
+            for file_obj in msg.get("files", []):
+                fid = file_obj.get("id")
+                if fid in done_ids:
+                    file_obj["_local_file"] = f"attachments/{s3fn_map[fid]}"
+            self.s3.upload_json(msg, f"{s3_base}/messages/{ts}.json")
 
         stats.save(force=True)
         checkpoint.complete_phase("attachments")
         checkpoint.save(force=True)
-        log.info("Downloaded %d attachments for channel %s", download_count, channel_id)
+        log.info("Downloaded %d attachments for channel %s", len(downloads), channel_id)
 
     def _download_one_file(self, url: str, s3_path: str) -> None:
         """Download a file and upload to S3. Uses requests timeout (no signal-based timeout)."""
