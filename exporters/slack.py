@@ -47,8 +47,10 @@ class SlackExporter:
         config: ExportConfig,
         include_threads: bool = False,
         skip_attachments: bool = False,
+        parallel: int = 1,
     ):
         self.channel_ids = channel_ids
+        self.parallel = parallel
         self.s3 = s3
         self.config = config
         self.include_threads = include_threads
@@ -65,12 +67,16 @@ class SlackExporter:
 
     def run(self):
         failed = []
-        for channel_id in self.channel_ids:
-            try:
-                self._export_channel(channel_id)
-            except Exception:
-                log.error("Export failed for channel %s, continuing with next", channel_id, exc_info=True)
-                failed.append(channel_id)
+        log.info("Exporting %d channels (%d in parallel)", len(self.channel_ids), self.parallel)
+        with ThreadPoolExecutor(max_workers=self.parallel) as pool:
+            futures = {pool.submit(self._export_channel, ch): ch for ch in self.channel_ids}
+            for future in as_completed(futures):
+                channel_id = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    log.error("Export failed for channel %s, continuing with next", channel_id, exc_info=True)
+                    failed.append(channel_id)
         if failed:
             log.error("Failed channels (%d/%d): %s",
                       len(failed), len(self.channel_ids), ", ".join(failed))
@@ -328,6 +334,8 @@ def main():
     parser.add_argument("--list-channels", action="store_true")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
+    parser.add_argument("--parallel", type=int, default=env_int("SLACK_PARALLEL", 1),
+                        help="Channels to export in parallel (default 1, all share one bot token)")
     parser.add_argument("--max-workers", type=int, default=env_int("SLACK_MAX_WORKERS", env_int("MAX_WORKERS", 3)))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
@@ -372,6 +380,7 @@ def main():
         config=config,
         include_threads=args.include_threads,
         skip_attachments=args.skip_attachments,
+        parallel=args.parallel,
     )
     exporter.run()
 

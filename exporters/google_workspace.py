@@ -176,6 +176,7 @@ class GoogleWorkspaceExporter:
                 userId="me",
                 maxResults=batch_size,
                 pageToken=page_token,
+                quotaUser=self.user,
             ).execute()
             for msg in resp.get("messages", []):
                 ids.append(msg["id"])
@@ -194,6 +195,7 @@ class GoogleWorkspaceExporter:
             try:
                 msg = service.users().messages().get(
                     userId="me", id=msg_id, format="raw",
+                    quotaUser=self.user,
                 ).execute()
                 results[msg_id] = msg
             except HttpError as e:
@@ -278,6 +280,7 @@ class GoogleWorkspaceExporter:
                     singleEvents=True,
                     orderBy="startTime",
                     pageToken=page_token,
+                    quotaUser=self.user,
                 ).execute()
             except HttpError as e:
                 log.error("Calendar API error: %s", e)
@@ -366,6 +369,7 @@ class GoogleWorkspaceExporter:
                     orderBy="modifiedTime desc",
                     fields="nextPageToken, files(id, name, mimeType, size, owners, modifiedTime)",
                     pageToken=page_token,
+                    quotaUser=self.user,
                 ).execute()
             except HttpError as e:
                 log.error("Drive list error: %s", e)
@@ -389,6 +393,7 @@ class GoogleWorkspaceExporter:
         name = file_meta.get("name", "untitled") + ext
 
         request = service.files().export_media(fileId=file_meta["id"], mimeType=export_mime)
+        request.uri += f"&quotaUser={self.user}"
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
             downloader = MediaIoBaseDownload(tmp, request)
             done = False
@@ -405,6 +410,7 @@ class GoogleWorkspaceExporter:
             name += ".bin"
 
         request = service.files().get_media(fileId=file_meta["id"])
+        request.uri += f"&quotaUser={self.user}"
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
             downloader = MediaIoBaseDownload(tmp, request)
             done = False
@@ -450,6 +456,8 @@ def main():
     parser.add_argument("--skip-gmail", action="store_true", default=env_bool("GOOGLE_SKIP_GMAIL"))
     parser.add_argument("--skip-calendar", action="store_true", default=env_bool("GOOGLE_SKIP_CALENDAR"))
     parser.add_argument("--skip-drive", action="store_true", default=env_bool("GOOGLE_SKIP_DRIVE"))
+    parser.add_argument("--parallel", type=int, default=env_int("GOOGLE_PARALLEL", 5),
+                        help="Users to export in parallel (default 5, each gets own API quota via quotaUser)")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
@@ -477,26 +485,34 @@ def main():
         max_workers=args.max_workers,
         log_level=args.log_level,
     )
+
+    def _export_one_user(user: str) -> None:
+        log.info("Exporting user %s", user)
+        exporter = GoogleWorkspaceExporter(
+            user=user,
+            service_account_key=args.key,
+            s3=s3,
+            config=config,
+            email_limit=args.emails,
+            event_limit=args.events,
+            file_limit=args.files,
+            skip_gmail=args.skip_gmail,
+            skip_calendar=args.skip_calendar,
+            skip_drive=args.skip_drive,
+        )
+        exporter.run()
+
     failed = []
-    for i, user in enumerate(users, 1):
-        log.info("Exporting user %s (%d of %d)", user, i, len(users))
-        try:
-            exporter = GoogleWorkspaceExporter(
-                user=user,
-                service_account_key=args.key,
-                s3=s3,
-                config=config,
-                email_limit=args.emails,
-                event_limit=args.events,
-                file_limit=args.files,
-                skip_gmail=args.skip_gmail,
-                skip_calendar=args.skip_calendar,
-                skip_drive=args.skip_drive,
-            )
-            exporter.run()
-        except Exception:
-            log.error("Export failed for user %s, continuing with next", user, exc_info=True)
-            failed.append(user)
+    log.info("Exporting %d users (%d in parallel)", len(users), args.parallel)
+    with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+        futures = {pool.submit(_export_one_user, u): u for u in users}
+        for future in as_completed(futures):
+            user = futures[future]
+            try:
+                future.result()
+            except Exception:
+                log.error("Export failed for user %s, continuing with next", user, exc_info=True)
+                failed.append(user)
     if failed:
         log.error("Failed users (%d/%d): %s", len(failed), len(users), ", ".join(failed))
 
