@@ -75,9 +75,11 @@ class JiraExporter:
         self.skip_comments = skip_comments
         self.base_url = f"https://{domain}/rest/api/3"
 
+        # Jira Cloud: 100 GET req/sec burst, ~28 req/sec sustained (Tier 2, 250 users).
+        # 20 rps with burst 40 is comfortably under both ceilings.
         self.session, self.rate_state = make_session(
-            requests_per_second=5,
-            burst=10,
+            requests_per_second=20,
+            burst=40,
             min_remaining=50,
         )
         self.session.auth = (email, token)
@@ -145,12 +147,10 @@ class JiraExporter:
             checkpoint.complete_phase("comments")
             checkpoint.save(force=True)
 
-        # Step 3: download attachments — one ticket at a time
+        # Step 3: download attachments — collect all URLs, download in parallel
         if not self.skip_attachments and not checkpoint.is_phase_done("attachments"):
             checkpoint.start_phase("attachments")
-            for key in ticket_keys:
-                ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
-                self._download_ticket_attachments(ticket, s3_base, checkpoint)
+            self._download_all_attachments(ticket_keys, s3_base, checkpoint)
             checkpoint.complete_phase("attachments")
             checkpoint.save(force=True)
 
@@ -407,26 +407,39 @@ class JiraExporter:
 
     # ── Attachments ───────────────────────────────────────────────────────
 
-    def _download_ticket_attachments(self, ticket: dict, s3_base: str,
-                                     checkpoint: CheckpointManager) -> None:
-        """Download attachments for a single ticket. One ticket in memory at a time."""
-        ticket_key = ticket["key"]
-        for att in ticket.get("attachments", []):
-            url = att.get("content_url")
-            if not url:
+    def _download_all_attachments(self, ticket_keys: list[str], s3_base: str,
+                                  checkpoint: CheckpointManager) -> None:
+        """Collect attachment URLs from all tickets, download in parallel."""
+        downloads = []
+        for key in ticket_keys:
+            ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
+            if not ticket:
                 continue
-            att_id = att.get("id", "unknown")
-            ck_id = f"{ticket_key}/{att_id}"
-            if checkpoint.is_item_done("attachments", ck_id):
-                continue
-            filename = att.get("filename", "unknown")
-            s3_path = f"{s3_base}/attachments/{ticket_key}/{filename}"
-            try:
-                self._stream_attachment_to_s3(url, s3_path, filename)
-                checkpoint.mark_item_done("attachments", ck_id)
-                checkpoint.save()
-            except Exception:
-                log.error("Failed to download attachment %s", ck_id, exc_info=True)
+            for att in ticket.get("attachments", []):
+                url = att.get("content_url")
+                if not url:
+                    continue
+                att_id = att.get("id", "unknown")
+                ck_id = f"{key}/{att_id}"
+                if checkpoint.is_item_done("attachments", ck_id):
+                    continue
+                filename = att.get("filename", "unknown")
+                s3_path = f"{s3_base}/attachments/{key}/{filename}"
+                downloads.append((ck_id, url, s3_path, filename))
+
+        log.info("Downloading %d attachments", len(downloads))
+
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+            futures = {pool.submit(self._stream_attachment_to_s3, url, s3_path, fn): ck_id
+                       for ck_id, url, s3_path, fn in downloads}
+            for future in as_completed(futures):
+                ck_id = futures[future]
+                try:
+                    future.result()
+                    checkpoint.mark_item_done("attachments", ck_id)
+                    checkpoint.save()
+                except Exception:
+                    log.error("Failed to download attachment %s", ck_id, exc_info=True)
 
     def _stream_attachment_to_s3(self, url: str, s3_path: str, filename: str) -> None:
         with tempfile.NamedTemporaryFile(suffix=f"_{filename}", delete=True) as tmp:
@@ -510,8 +523,8 @@ def main():
     parser.add_argument("--limit", type=int, default=env_int("JIRA_LIMIT", 0), help="Max tickets per project (0=all)")
     parser.add_argument("--skip-attachments", action="store_true", default=env_bool("JIRA_SKIP_ATTACHMENTS"))
     parser.add_argument("--skip-comments", action="store_true", default=env_bool("JIRA_SKIP_COMMENTS"))
-    parser.add_argument("--parallel", type=int, default=env_int("JIRA_PARALLEL", 1),
-                        help="Projects to export in parallel (default 1, all share one API token)")
+    parser.add_argument("--parallel", type=int, default=env_int("JIRA_PARALLEL", 3),
+                        help="Projects to export in parallel (default 3, share tenant rate limit)")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))

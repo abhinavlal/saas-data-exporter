@@ -609,7 +609,7 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Export GitHub repository data to S3")
-    parser.add_argument("--token", default=env("GITHUB_TOKEN"), help="GitHub personal access token")
+    parser.add_argument("--token", default=env("GITHUB_TOKEN"), help="GitHub PAT (or comma-separated list for round-robin)")
     parser.add_argument("--repo", nargs="+", help="Repository(s) in owner/repo format")
     parser.add_argument("--input-csv", default=env("GITHUB_INPUT_CSV"), help="CSV file with 'repo' column")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
@@ -635,6 +635,11 @@ def main():
     if not args.s3_bucket:
         parser.error("--s3-bucket is required (or set S3_BUCKET)")
 
+    # Support multiple PATs: comma-separated in --token or GITHUB_TOKENS env var
+    tokens = [t.strip() for t in args.token.split(",") if t.strip()]
+    if not tokens:
+        tokens = env_list("GITHUB_TOKENS") or [args.token]
+
     # --include-commits overrides --skip-commits
     if args.include_commits:
         args.skip_commits = False
@@ -657,10 +662,10 @@ def main():
         log_level=args.log_level,
     )
 
-    def _export_one_repo(repo: str) -> None:
+    def _export_one_repo(repo: str, token: str) -> None:
         log.info("Exporting repo %s", repo)
         exporter = GitHubExporter(
-            token=args.token,
+            token=token,
             repo=repo,
             s3=s3,
             config=config,
@@ -674,9 +679,11 @@ def main():
         exporter.run()
 
     failed = []
-    log.info("Exporting %d repos (%d in parallel)", len(repos), args.parallel)
+    log.info("Exporting %d repos (%d in parallel, %d PATs)", len(repos), args.parallel, len(tokens))
     with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        futures = {pool.submit(_export_one_repo, r): r for r in repos}
+        # Round-robin tokens across repos — each repo gets its own rate limit bucket
+        futures = {pool.submit(_export_one_repo, r, tokens[i % len(tokens)]): r
+                   for i, r in enumerate(repos)}
         for future in as_completed(futures):
             repo = futures[future]
             try:
