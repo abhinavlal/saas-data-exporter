@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
+from lib.stats import StatsCollector
 from lib.session import make_session
 from lib.logging import setup_logging
 from lib.types import ExportConfig
@@ -105,6 +106,10 @@ class JiraExporter:
         checkpoint = CheckpointManager(self.s3, f"jira/{project_key}")
         checkpoint.load()
         s3_base = f"jira/{project_key}"
+        stats = StatsCollector(self.s3, f"{s3_base}/_stats.json")
+        stats.load()
+        stats.set("exporter", "jira")
+        stats.set("target", project_key)
 
         # Resolve custom field names
         if self._field_map is None:
@@ -112,7 +117,7 @@ class JiraExporter:
 
         # Step 1: search tickets — writes each ticket to tickets/{key}.json
         if not checkpoint.is_phase_done("tickets"):
-            self._search_tickets(project_key, checkpoint)
+            self._search_tickets(project_key, checkpoint, stats)
             checkpoint.complete_phase("tickets")
             checkpoint.save(force=True)
 
@@ -129,8 +134,14 @@ class JiraExporter:
                 ticket = self.s3.download_json(f"{s3_base}/tickets/{key}.json")
                 ticket["comments"] = self._fetch_comments(key)
                 self.s3.upload_json(ticket, f"{s3_base}/tickets/{key}.json")
+                comment_count = len(ticket["comments"])
+                stats.increment("comments.total", comment_count)
+                if comment_count:
+                    stats.increment("comments.tickets_with_comments")
+                stats.save()
                 checkpoint.mark_item_done("comments", key)
                 checkpoint.save()
+            stats.save(force=True)
             checkpoint.complete_phase("comments")
             checkpoint.save(force=True)
 
@@ -145,12 +156,17 @@ class JiraExporter:
 
         # Step 4: generate CSV — one ticket at a time
         self._upload_csv(ticket_keys, index.get("custom_fields", []), s3_base)
+
+        from datetime import datetime, timezone
+        stats.set("exported_at", datetime.now(timezone.utc).isoformat())
+        stats.save(force=True)
         checkpoint.complete()
         log.info("Jira export complete for %s (%d tickets)", project_key, len(ticket_keys))
 
     # ── Ticket Search ─────────────────────────────────────────────────────
 
-    def _search_tickets(self, project_key: str, checkpoint: CheckpointManager) -> None:
+    def _search_tickets(self, project_key: str, checkpoint: CheckpointManager,
+                        stats: StatsCollector) -> None:
         """Search tickets and write each to its own S3 file. Builds _index.json."""
         checkpoint.start_phase("tickets", total=self.limit or None)
         s3_base = f"jira/{project_key}"
@@ -191,6 +207,24 @@ class JiraExporter:
                 custom_fields.update(
                     k for k in ticket if k.startswith("Custom field")
                 )
+
+                # Accumulate ticket stats
+                stats.increment("tickets.total")
+                stats.add_to_map("tickets.by_type", ticket.get("issue_type") or "Unknown")
+                stats.add_to_map("tickets.by_status", ticket.get("status") or "Unknown")
+                stats.add_to_map("tickets.by_status_category", ticket.get("status_category") or "Unknown")
+                stats.add_to_map("tickets.by_priority", ticket.get("priority") or "Unknown")
+                for label in ticket.get("labels", []):
+                    stats.add_to_map("tickets.labels", label)
+                for comp in ticket.get("components", []):
+                    stats.add_to_map("tickets.components", comp)
+                for att in ticket.get("attachments", []):
+                    stats.increment("attachments.total")
+                    stats.add_to_map("attachments.by_mime_type", att.get("mime_type") or "unknown")
+                    stats.increment("attachments.total_size_bytes", att.get("size") or 0)
+                stats.increment("changelog.total", len(ticket.get("changelog", [])))
+                stats.save()
+
                 checkpoint.mark_item_done("tickets", key)
                 ticket_count += 1
 
@@ -206,6 +240,7 @@ class JiraExporter:
             {"keys": keys, "custom_fields": sorted(custom_fields)},
             f"{s3_base}/tickets/_index.json",
         )
+        stats.save(force=True)
         log.info("Fetched %d tickets for %s", ticket_count, project_key)
 
     def _parse_ticket(self, issue: dict) -> dict:

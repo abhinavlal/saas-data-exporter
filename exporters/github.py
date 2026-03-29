@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
+from lib.stats import StatsCollector
 from lib.session import make_session
 from lib.logging import setup_logging
 from lib.types import ExportConfig
@@ -52,9 +53,14 @@ class GitHubExporter:
         self.repo_slug = repo.replace("/", "__")
         self.s3_base = f"github/{self.repo_slug}"
         self.checkpoint = CheckpointManager(s3, f"github/{self.repo_slug}")
+        self.stats = StatsCollector(s3, f"{self.s3_base}/_stats.json")
 
     def run(self):
         self.checkpoint.load()
+        self.stats.load()
+        self.stats.set("exporter", "github")
+        self.stats.set("target", self.repo)
+        self.stats.set("target_slug", self.repo_slug)
         log.info("Starting GitHub export for %s", self.repo)
 
         if not self.checkpoint.is_phase_done("metadata"):
@@ -70,6 +76,9 @@ class GitHubExporter:
             self._export_pull_requests()
 
         self.checkpoint.complete()
+        from datetime import datetime, timezone
+        self.stats.set("exported_at", datetime.now(timezone.utc).isoformat())
+        self.stats.save(force=True)
         log.info("GitHub export complete for %s", self.repo)
 
     # ── Metadata ──────────────────────────────────────────────────────────
@@ -111,6 +120,19 @@ class GitHubExporter:
         }
 
         self.s3.upload_json(metadata, f"{self.s3_base}/repo_metadata.json")
+
+        self.stats.set("repo", {
+            "full_name": metadata.get("full_name"),
+            "private": metadata.get("private"),
+            "default_branch": metadata.get("default_branch"),
+            "stars": metadata.get("stargazers_count", 0),
+            "forks": metadata.get("forks_count", 0),
+            "open_issues": metadata.get("open_issues_count", 0),
+            "watchers": metadata.get("watchers_count", 0),
+        })
+        self.stats.set("languages", language_breakdown)
+        self.stats.save(force=True)
+
         self.checkpoint.complete_phase("metadata")
         self.checkpoint.save(force=True)
         log.info("Metadata exported")
@@ -144,6 +166,12 @@ class GitHubExporter:
 
         contributors.sort(key=lambda c: c["contributions"], reverse=True)
         self.s3.upload_json(contributors, f"{self.s3_base}/contributors.json")
+
+        self.stats.set_nested("contributors.total", len(contributors))
+        if contributors:
+            self.stats.set_nested("contributors.top", contributors[0].get("login"))
+        self.stats.save(force=True)
+
         self.checkpoint.complete_phase("contributors")
         self.checkpoint.save(force=True)
         log.info("Exported %d contributors", len(contributors))
@@ -185,6 +213,22 @@ class GitHubExporter:
                         self.checkpoint.save()
                     except Exception:
                         log.error("Failed to fetch commit %s", sha, exc_info=True)
+
+        # Commit stats — computed from full list (always re-fetched)
+        authors = set()
+        dates = []
+        for c in commits:
+            author = c.get("author_login") or c.get("author_email")
+            if author:
+                authors.add(author)
+            if c.get("author_date"):
+                dates.append(c["author_date"])
+        self.stats.set_nested("commits.total", len(commits))
+        self.stats.set_nested("commits.unique_authors", len(authors))
+        if dates:
+            self.stats.set_nested("commits.earliest", min(dates))
+            self.stats.set_nested("commits.latest", max(dates))
+        self.stats.save(force=True)
 
         self.checkpoint.complete_phase("commits")
         self.checkpoint.save(force=True)
@@ -295,16 +339,20 @@ class GitHubExporter:
                 try:
                     pr = future.result()
                     if pr:
-                        # Write individual PR file — full data, memory freed immediately
                         self.s3.upload_json(pr, f"{self.s3_base}/prs/{number}.json")
                         csv_rows.append(self._pr_to_csv_row(pr))
+                        self._accumulate_pr_stats(pr)
+                        self.stats.save()
                     self.checkpoint.mark_item_done("pull_requests", number)
                     self.checkpoint.save()
                 except Exception:
                     log.error("Failed to fetch PR #%d", number, exc_info=True)
 
+        # Total PR count includes already-done items from prior runs
+        self.stats.set_nested("pull_requests.total", len(pr_numbers))
         csv_rows.sort(key=lambda r: r.get("number", 0), reverse=True)
         self._upload_pr_csv(csv_rows)
+        self.stats.save(force=True)
         self.checkpoint.complete_phase("pull_requests")
         self.checkpoint.save(force=True)
         log.info("Exported %d pull requests", len(csv_rows))
@@ -471,6 +519,34 @@ class GitHubExporter:
                 })
             page += 1
         return items
+
+    # ── Stats ────────────────────────────────────────────────────────────
+
+    def _accumulate_pr_stats(self, pr: dict) -> None:
+        """Accumulate per-PR statistics into the stats collector."""
+        state = pr.get("state", "unknown")
+        merged = pr.get("merged_at") is not None
+        if merged:
+            self.stats.increment("pull_requests.merged")
+        elif state == "open":
+            self.stats.increment("pull_requests.open")
+        elif state == "closed":
+            self.stats.increment("pull_requests.closed")
+
+        self.stats.increment("pull_requests.total_reviews",
+                             len(pr.get("reviews", [])))
+        self.stats.increment("pull_requests.total_review_comments",
+                             len(pr.get("review_comments", [])))
+        self.stats.increment("pull_requests.total_comments",
+                             len(pr.get("comments", [])))
+        self.stats.increment("pull_requests.total_additions",
+                             pr.get("additions") or 0)
+        self.stats.increment("pull_requests.total_deletions",
+                             pr.get("deletions") or 0)
+        self.stats.increment("pull_requests.total_changed_files",
+                             pr.get("changed_files") or 0)
+        for label in pr.get("labels", []):
+            self.stats.add_to_map("pull_requests.labels", label)
 
     # ── CSV ───────────────────────────────────────────────────────────────
 

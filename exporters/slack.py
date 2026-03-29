@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
+from lib.stats import StatsCollector
 from lib.session import make_session
 from lib.logging import setup_logging
 from lib.types import ExportConfig
@@ -86,32 +87,41 @@ class SlackExporter:
         checkpoint = CheckpointManager(self.s3, f"slack/{channel_id}")
         checkpoint.load()
         s3_base = f"slack/{channel_id}"
+        stats = StatsCollector(self.s3, f"{s3_base}/_stats.json")
+        stats.load()
+        stats.set("exporter", "slack")
+        stats.set("target", channel_id)
 
         # Step 1: channel info
         if not checkpoint.is_phase_done("channel_info"):
-            self._fetch_and_upload_channel_info(channel_id, s3_base, checkpoint)
+            self._fetch_and_upload_channel_info(channel_id, s3_base, checkpoint, stats)
 
         # Step 2: messages — each written to messages/{ts}.json
         if not checkpoint.is_phase_done("messages"):
-            self._fetch_messages(channel_id, s3_base, checkpoint)
+            self._fetch_messages(channel_id, s3_base, checkpoint, stats)
 
         # Step 3: thread replies — load each parent, fetch replies, update file
         if self.include_threads and not checkpoint.is_phase_done("threads"):
-            self._fetch_thread_replies(channel_id, s3_base, checkpoint)
+            self._fetch_thread_replies(channel_id, s3_base, checkpoint, stats)
 
         # Step 4: download attachments — iterate message index
         if not self.skip_attachments and not checkpoint.is_phase_done("attachments"):
-            self._download_attachments_from_index(channel_id, s3_base, checkpoint)
+            self._download_attachments_from_index(channel_id, s3_base, checkpoint, stats)
 
         # Load index for final count
         index = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
+
+        from datetime import datetime, timezone
+        stats.set("exported_at", datetime.now(timezone.utc).isoformat())
+        stats.save(force=True)
         checkpoint.complete()
         log.info("Slack export complete for channel %s (%d messages)", channel_id, len(index))
 
     # ── Channel Info ──────────────────────────────────────────────────────
 
     def _fetch_and_upload_channel_info(self, channel_id: str, s3_base: str,
-                                       checkpoint: CheckpointManager) -> None:
+                                       checkpoint: CheckpointManager,
+                                       stats: StatsCollector) -> None:
         checkpoint.start_phase("channel_info")
         resp = self.session.get(
             f"{SLACK_API}/conversations.info",
@@ -123,14 +133,24 @@ class SlackExporter:
             log.error("conversations.info failed: %s", data.get("error"))
             return
 
-        self.s3.upload_json(data.get("channel", {}), f"{s3_base}/channel_info.json")
+        channel = data.get("channel", {})
+        self.s3.upload_json(channel, f"{s3_base}/channel_info.json")
+
+        stats.set("channel", {
+            "name": channel.get("name"),
+            "is_private": channel.get("is_private"),
+            "num_members": channel.get("num_members"),
+        })
+        stats.save(force=True)
+
         checkpoint.complete_phase("channel_info")
         checkpoint.save(force=True)
 
     # ── Messages ──────────────────────────────────────────────────────────
 
     def _fetch_messages(self, channel_id: str, s3_base: str,
-                        checkpoint: CheckpointManager) -> None:
+                        checkpoint: CheckpointManager,
+                        stats: StatsCollector) -> None:
         """Fetch messages and write each to messages/{ts}.json. Builds _index.json."""
         checkpoint.start_phase("messages")
         ts_list: list[str] = []
@@ -152,6 +172,22 @@ class SlackExporter:
                 ts = msg.get("ts", "0")
                 self.s3.upload_json(msg, f"{s3_base}/messages/{ts}.json")
                 ts_list.append(ts)
+
+                # Accumulate message stats
+                stats.increment("messages.total")
+                subtype = msg.get("subtype", "user_message")
+                stats.add_to_map("messages.by_subtype", subtype)
+                if msg.get("reactions"):
+                    stats.increment("messages.with_reactions")
+                    for r in msg.get("reactions", []):
+                        stats.increment("messages.total_reactions", r.get("count", 0))
+                for f in msg.get("files", []):
+                    stats.increment("files.total")
+                    name = f.get("name", "")
+                    ext = ("." + name.rsplit(".", 1)[-1]).lower() if "." in name else ".unknown"
+                    stats.add_to_map("files.by_extension", ext)
+                stats.save()
+
                 checkpoint.mark_item_done("messages", ts)
 
             next_cursor = data.get("response_metadata", {}).get("next_cursor")
@@ -164,6 +200,7 @@ class SlackExporter:
 
         # Write lightweight index (just timestamps)
         self.s3.upload_json(ts_list, f"{s3_base}/messages/_index.json")
+        stats.save(force=True)
         checkpoint.complete_phase("messages")
         checkpoint.save(force=True)
         log.info("Fetched %d messages from %s", len(ts_list), channel_id)
@@ -171,7 +208,8 @@ class SlackExporter:
     # ── Thread Replies ────────────────────────────────────────────────────
 
     def _fetch_thread_replies(self, channel_id: str, s3_base: str,
-                              checkpoint: CheckpointManager) -> None:
+                              checkpoint: CheckpointManager,
+                              stats: StatsCollector) -> None:
         """Fetch thread replies and embed them as a `_replies` array inside
         the parent message file. One parent loaded at a time."""
         checkpoint.start_phase("threads")
@@ -198,11 +236,17 @@ class SlackExporter:
                     parent["_replies"] = replies
                     self.s3.upload_json(parent, f"{s3_base}/messages/{thread_ts}.json")
                 reply_count += len(replies)
+
+                stats.increment("messages.thread_parents")
+                stats.increment("messages.total_thread_replies", len(replies))
+                stats.save()
+
                 checkpoint.mark_item_done("threads", thread_ts)
                 checkpoint.save()
             except Exception:
                 log.error("Failed to fetch thread %s", thread_ts, exc_info=True)
 
+        stats.save(force=True)
         checkpoint.complete_phase("threads")
         checkpoint.save(force=True)
         log.info("Fetched %d thread replies across %d threads", reply_count, len(thread_parents))
@@ -238,7 +282,8 @@ class SlackExporter:
     # ── Attachments ───────────────────────────────────────────────────────
 
     def _download_attachments_from_index(self, channel_id: str, s3_base: str,
-                                        checkpoint: CheckpointManager) -> None:
+                                        checkpoint: CheckpointManager,
+                                        stats: StatsCollector) -> None:
         """Download attachments by iterating message index — one message at a time."""
         checkpoint.start_phase("attachments")
         index = self.s3.download_json(f"{s3_base}/messages/_index.json") or []
@@ -266,6 +311,8 @@ class SlackExporter:
                     file_obj["_local_file"] = f"attachments/{s3_filename}"
                     updated = True
                     download_count += 1
+                    stats.increment("files.downloaded")
+                    stats.save()
                     checkpoint.mark_item_done("attachments", file_id)
                     checkpoint.save()
                 except Exception:
@@ -274,6 +321,7 @@ class SlackExporter:
             if updated:
                 self.s3.upload_json(msg, f"{s3_base}/messages/{ts}.json")
 
+        stats.save(force=True)
         checkpoint.complete_phase("attachments")
         checkpoint.save(force=True)
         log.info("Downloaded %d attachments for channel %s", download_count, channel_id)

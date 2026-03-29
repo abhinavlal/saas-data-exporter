@@ -414,5 +414,13 @@ class TestFullExport:
             f"google/{USER_SLUG}/calendar/events/e1.json",
             f"google/{USER_SLUG}/calendar/_index.json",
             f"google/{USER_SLUG}/drive/_index.json",
+            f"google/{USER_SLUG}/_stats.json",
         }
         assert expected.issubset(keys), f"Missing keys: {expected - keys}"
+
+        # Verify stats content
+        stats = store.download_json(f"google/{USER_SLUG}/_stats.json")
+        assert stats["exporter"] == "google_workspace"
+        assert stats["target"] == USER
+        assert stats["gmail"]["total_messages"] == 1
+        assert stats["calendar"]["total_events"] == 1
