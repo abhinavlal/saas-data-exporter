@@ -623,8 +623,8 @@ def main():
     parser.add_argument("--skip-prs", action="store_true", default=env_bool("GITHUB_SKIP_PRS"))
     parser.add_argument("--commit-details", action="store_true", default=env_bool("GITHUB_COMMIT_DETAILS"),
                         help="Fetch full commit details (stats, files, patches) — 1 API call per commit")
-    parser.add_argument("--parallel", type=int, default=env_int("GITHUB_PARALLEL", 2),
-                        help="Repos to export in parallel (default 2, all share one PAT rate limit)")
+    parser.add_argument("--parallel", type=int, default=env_int("GITHUB_PARALLEL", 4),
+                        help="Repos to export in parallel (default 4, use multiple PATs for independent rate limits)")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
