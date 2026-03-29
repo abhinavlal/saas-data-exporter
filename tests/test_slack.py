@@ -390,5 +390,13 @@ class TestFullExport:
             f"slack/{CHANNEL}/messages/1700000001.000000.json",
             f"slack/{CHANNEL}/messages/_index.json",
             f"slack/{CHANNEL}/attachments/F0FULL_doc.txt",
+            f"slack/{CHANNEL}/_stats.json",
         }
         assert expected.issubset(keys)
+
+        # Verify stats content
+        stats = store.download_json(f"slack/{CHANNEL}/_stats.json")
+        assert stats["exporter"] == "slack"
+        assert stats["target"] == CHANNEL
+        assert stats["messages"]["total"] == 1
+        assert "channel" in stats

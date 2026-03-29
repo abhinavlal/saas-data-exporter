@@ -17,6 +17,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
+from lib.stats import StatsCollector
 from lib.retry import retry
 from lib.logging import setup_logging
 from lib.types import ExportConfig
@@ -91,12 +92,17 @@ class GoogleWorkspaceExporter:
         self.credentials = credentials.with_subject(user)
 
         self.checkpoint = CheckpointManager(s3, f"google/{self.user_slug}")
+        self.stats = StatsCollector(s3, f"{self.s3_base}/_stats.json")
 
     def _build_service(self, api: str, version: str):
         return build(api, version, credentials=self.credentials, cache_discovery=False)
 
     def run(self):
         self.checkpoint.load()
+        self.stats.load()
+        self.stats.set("exporter", "google_workspace")
+        self.stats.set("target", self.user)
+        self.stats.set("target_slug", self.user_slug)
         log.info("Starting Google Workspace export for %s", self.user)
 
         if not self.skip_gmail and not self.checkpoint.is_phase_done("gmail"):
@@ -109,6 +115,8 @@ class GoogleWorkspaceExporter:
             self._export_drive()
 
         self.checkpoint.complete()
+        self.stats.set("exported_at", datetime.now(timezone.utc).isoformat())
+        self.stats.save(force=True)
         log.info("Google Workspace export complete for %s", self.user)
 
     # ── Gmail ─────────────────────────────────────────────────────────────
@@ -150,15 +158,30 @@ class GoogleWorkspaceExporter:
                 try:
                     entry = self._build_index_entry(msg_id, msg_data)
                     index_entries.append(entry)
+
+                    # Accumulate gmail stats from index entry
+                    self.stats.increment("gmail.total_messages")
+                    self.stats.increment("gmail.total_size_bytes", entry.get("sizeEstimate") or 0)
+                    for label in entry.get("labelIds", []):
+                        self.stats.add_to_map("gmail.labels", label)
+                    attachments = entry.get("attachments", [])
+                    if attachments:
+                        self.stats.increment("gmail.messages_with_attachments")
+                    for fname in attachments:
+                        self.stats.increment("gmail.total_attachments")
+                        ext = ("." + fname.rsplit(".", 1)[-1]).lower() if "." in fname else ".unknown"
+                        self.stats.add_to_map("gmail.attachments_by_extension", ext)
                 except Exception:
                     log.error("Failed to build index for message %s", msg_id, exc_info=True)
                 self.checkpoint.mark_item_done("gmail", msg_id)
 
+            self.stats.save()
             self.checkpoint.save()
             time.sleep(2)  # 2s between batches
 
         # Upload index
         self.s3.upload_json(index_entries, f"{self.s3_base}/gmail/_index.json")
+        self.stats.save(force=True)
         self.checkpoint.complete_phase("gmail")
         self.checkpoint.save(force=True)
         log.info("Exported %d Gmail messages", len(index_entries))
@@ -292,6 +315,17 @@ class GoogleWorkspaceExporter:
                 self.s3.upload_json(event, f"{self.s3_base}/calendar/events/{event_id}.json")
                 event_ids.append(event_id)
                 event_count += 1
+
+                # Accumulate calendar stats
+                self.stats.increment("calendar.total_events")
+                if event.get("attendees"):
+                    self.stats.increment("calendar.with_attendees")
+                    self.stats.increment("calendar.total_attendees", len(event["attendees"]))
+                if event.get("location"):
+                    self.stats.increment("calendar.with_location")
+                self.stats.add_to_map("calendar.by_status", event.get("status") or "unknown")
+                self.stats.save()
+
                 self.checkpoint.mark_item_done("calendar", event_id)
                 if self.event_limit and event_count >= self.event_limit:
                     break
@@ -303,6 +337,7 @@ class GoogleWorkspaceExporter:
         # Write index
         self.s3.upload_json(event_ids, f"{self.s3_base}/calendar/_index.json")
 
+        self.stats.save(force=True)
         self.checkpoint.complete_phase("calendar")
         self.checkpoint.save(force=True)
         log.info("Exported %d calendar events", event_count)
@@ -322,14 +357,18 @@ class GoogleWorkspaceExporter:
         for file_meta in files:
             file_id = file_meta["id"]
             if self.checkpoint.is_item_done("drive", file_id):
-                index.append(self._drive_index_entry(file_meta, downloaded=True))
+                entry = self._drive_index_entry(file_meta, downloaded=True)
+                index.append(entry)
+                self._accumulate_drive_stats(entry)
                 continue
 
             mime = file_meta.get("mimeType", "")
 
             # Skip unwanted types
             if mime in SKIP_DRIVE_TYPES or mime.startswith("image/") or mime.startswith("video/"):
-                index.append(self._drive_index_entry(file_meta, downloaded=False, reason="skipped_type"))
+                entry = self._drive_index_entry(file_meta, downloaded=False, reason="skipped_type")
+                index.append(entry)
+                self._accumulate_drive_stats(entry)
                 self.checkpoint.mark_item_done("drive", file_id)
                 self.checkpoint.save()
                 continue
@@ -339,19 +378,34 @@ class GoogleWorkspaceExporter:
                     self._export_google_doc(service, file_meta)
                 else:
                     self._download_drive_file(service, file_meta)
-                index.append(self._drive_index_entry(file_meta, downloaded=True))
+                entry = self._drive_index_entry(file_meta, downloaded=True)
+                index.append(entry)
             except Exception:
                 log.error("Failed to download Drive file %s", file_meta.get("name"), exc_info=True)
-                index.append(self._drive_index_entry(file_meta, downloaded=False, reason="error"))
+                entry = self._drive_index_entry(file_meta, downloaded=False, reason="error")
+                index.append(entry)
 
+            self._accumulate_drive_stats(entry)
+            self.stats.save()
             self.checkpoint.mark_item_done("drive", file_id)
             self.checkpoint.save()
             time.sleep(0.3)
 
         self.s3.upload_json(index, f"{self.s3_base}/drive/_index.json")
+        self.stats.save(force=True)
         self.checkpoint.complete_phase("drive")
         self.checkpoint.save(force=True)
         log.info("Exported %d Drive files", len(index))
+
+    def _accumulate_drive_stats(self, entry: dict) -> None:
+        """Accumulate stats from a drive index entry."""
+        self.stats.increment("drive.total_files")
+        if entry.get("downloaded"):
+            self.stats.increment("drive.downloaded")
+        else:
+            self.stats.increment("drive.skipped")
+        self.stats.add_to_map("drive.by_mime_type", entry.get("mimeType") or "unknown")
+        self.stats.increment("drive.total_size_bytes", int(entry.get("size") or 0))
 
     def _list_drive_files(self, service) -> list[dict]:
         files = []

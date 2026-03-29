@@ -400,5 +400,13 @@ class TestFullExport:
             f"jira/{PROJECT}/tickets/_index.json",
             f"jira/{PROJECT}/tickets.csv",
             f"jira/{PROJECT}/attachments/TEST-1/report.pdf",
+            f"jira/{PROJECT}/_stats.json",
         }
         assert expected.issubset(keys)
+
+        # Verify stats content
+        stats = store.download_json(f"jira/{PROJECT}/_stats.json")
+        assert stats["exporter"] == "jira"
+        assert stats["target"] == PROJECT
+        assert stats["tickets"]["total"] == 1
+        assert "by_type" in stats["tickets"]

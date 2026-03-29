@@ -390,5 +390,15 @@ class TestFullExport:
             f"github/{SLUG}/commits/sha1.json",
             f"github/{SLUG}/prs/1.json",
             f"github/{SLUG}/pull_requests.csv",
+            f"github/{SLUG}/_stats.json",
         }
         assert expected.issubset(keys)
+
+        # Verify stats content
+        stats = store.download_json(f"github/{SLUG}/_stats.json")
+        assert stats["exporter"] == "github"
+        assert stats["target"] == REPO
+        assert "repo" in stats
+        assert "languages" in stats
+        assert stats["commits"]["total"] == 2
+        assert stats["pull_requests"]["total"] == 1
