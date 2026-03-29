@@ -525,7 +525,8 @@ def main():
     parser.add_argument("--skip-comments", action="store_true", default=env_bool("JIRA_SKIP_COMMENTS"))
     parser.add_argument("--parallel", type=int, default=env_int("JIRA_PARALLEL", 3),
                         help="Projects to export in parallel (default 3, share tenant rate limit)")
-    parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
+    parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 10),
+                        help="Parallel attachment downloads (default 10, binary fetches not rate-limited)")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
     args = parser.parse_args()

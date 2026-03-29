@@ -512,7 +512,8 @@ def main():
     parser.add_argument("--skip-drive", action="store_true", default=env_bool("GOOGLE_SKIP_DRIVE"))
     parser.add_argument("--parallel", type=int, default=env_int("GOOGLE_PARALLEL", 50),
                         help="Users to export in parallel (default 50, each gets own API quota via quotaUser)")
-    parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
+    parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5),
+                        help="Parallel uploads per user (default 5, conservative since 50 users run in parallel)")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
     args = parser.parse_args()

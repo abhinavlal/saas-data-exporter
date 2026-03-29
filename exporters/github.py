@@ -625,7 +625,8 @@ def main():
                         help="Fetch full commit details (stats, files, patches) — 1 API call per commit")
     parser.add_argument("--parallel", type=int, default=env_int("GITHUB_PARALLEL", 4),
                         help="Repos to export in parallel (default 4, use multiple PATs for independent rate limits)")
-    parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 5))
+    parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 10),
+                        help="Parallel PR/commit detail fetches per repo (default 10, throttled by TokenBucket)")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
     args = parser.parse_args()
