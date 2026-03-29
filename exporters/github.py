@@ -1,8 +1,6 @@
 """GitHub Repository Exporter — exports repo metadata, contributors, commits, and PRs to S3."""
 
 import argparse
-import csv
-import io
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -331,7 +329,7 @@ class GitHubExporter:
         log.info("Fetching details for %d PRs (%d already done)",
                  len(to_fetch), len(pr_numbers) - len(to_fetch))
 
-        csv_rows = []
+        pr_count = 0
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
             futures = {pool.submit(self._fetch_pr_detail, n): n for n in to_fetch}
             for future in as_completed(futures):
@@ -340,22 +338,19 @@ class GitHubExporter:
                     pr = future.result()
                     if pr:
                         self.s3.upload_json(pr, f"{self.s3_base}/prs/{number}.json")
-                        csv_rows.append(self._pr_to_csv_row(pr))
                         self._accumulate_pr_stats(pr)
                         self.stats.save()
+                        pr_count += 1
                     self.checkpoint.mark_item_done("pull_requests", number)
                     self.checkpoint.save()
                 except Exception:
                     log.error("Failed to fetch PR #%d", number, exc_info=True)
 
-        # Total PR count includes already-done items from prior runs
         self.stats.set_nested("pull_requests.total", len(pr_numbers))
-        csv_rows.sort(key=lambda r: r.get("number", 0), reverse=True)
-        self._upload_pr_csv(csv_rows)
         self.stats.save(force=True)
         self.checkpoint.complete_phase("pull_requests")
         self.checkpoint.save(force=True)
-        log.info("Exported %d pull requests", len(csv_rows))
+        log.info("Exported %d pull requests", pr_count)
 
     def _list_pr_numbers(self) -> list[int]:
         numbers = []
@@ -548,58 +543,6 @@ class GitHubExporter:
         for label in pr.get("labels", []):
             self.stats.add_to_map("pull_requests.labels", label)
 
-    # ── CSV ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _pr_to_csv_row(pr: dict) -> dict:
-        """Extract lightweight CSV row from a full PR dict."""
-        body = pr.get("body") or ""
-        return {
-            "number": pr.get("number"),
-            "title": pr.get("title"),
-            "state": pr.get("state"),
-            "author": pr.get("author"),
-            "created_at": pr.get("created_at"),
-            "updated_at": pr.get("updated_at"),
-            "closed_at": pr.get("closed_at"),
-            "merged_at": pr.get("merged_at"),
-            "draft": pr.get("draft"),
-            "body": body[:1000],
-            "head_ref": pr.get("head_ref"),
-            "base_ref": pr.get("base_ref"),
-            "labels": "|".join(pr.get("labels", [])),
-            "assignees": "|".join(pr.get("assignees", [])),
-            "requested_reviewers": "|".join(pr.get("requested_reviewers", [])),
-            "additions": pr.get("additions"),
-            "deletions": pr.get("deletions"),
-            "changed_files": pr.get("changed_files"),
-            "review_count": len(pr.get("reviews", [])),
-            "comment_count": len(pr.get("comments", [])),
-            "html_url": pr.get("html_url"),
-        }
-
-    def _upload_pr_csv(self, rows: list[dict]) -> None:
-        if not rows:
-            self.s3.upload_bytes(b"", f"{self.s3_base}/pull_requests.csv", "text/csv")
-            return
-
-        output = io.StringIO()
-        fieldnames = [
-            "number", "title", "state", "author", "created_at", "updated_at",
-            "closed_at", "merged_at", "draft", "body", "head_ref", "base_ref",
-            "labels", "assignees", "requested_reviewers", "additions", "deletions",
-            "changed_files", "review_count", "comment_count", "html_url",
-        ]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-        self.s3.upload_bytes(
-            output.getvalue().encode("utf-8"),
-            f"{self.s3_base}/pull_requests.csv",
-            content_type="text/csv",
-        )
 
 
 def main():

@@ -25,6 +25,7 @@ Checkpoint structure:
 }
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -71,6 +72,7 @@ class CheckpointManager:
         self.started_at: str | None = None
         self.updated_at: str | None = None
         self._last_save_time = 0.0
+        self._lock = threading.Lock()
 
     def load(self) -> bool:
         """Load checkpoint from S3. Returns True if a checkpoint existed."""
@@ -94,28 +96,30 @@ class CheckpointManager:
         return True
 
     def save(self, force: bool = False) -> None:
-        """Save checkpoint to S3. Throttled to SAVE_INTERVAL unless force=True."""
-        now = time.monotonic()
-        if not force and (now - self._last_save_time) < self.SAVE_INTERVAL:
-            return
-        self.updated_at = datetime.now(timezone.utc).isoformat()
-        data = {
-            "job_id": self.job_id,
-            "status": self.status,
-            "started_at": self.started_at,
-            "updated_at": self.updated_at,
-            "phases": {},
-        }
-        for name, phase in self.phases.items():
-            data["phases"][name] = {
-                "status": phase.status,
-                "total": phase.total,
-                "completed": phase.completed,
-                "cursor": phase.cursor,
-                "completed_ids": list(phase.completed_ids),
+        """Save checkpoint to S3. Throttled to SAVE_INTERVAL unless force=True.
+        Thread-safe — serializes concurrent saves."""
+        with self._lock:
+            now = time.monotonic()
+            if not force and (now - self._last_save_time) < self.SAVE_INTERVAL:
+                return
+            self.updated_at = datetime.now(timezone.utc).isoformat()
+            data = {
+                "job_id": self.job_id,
+                "status": self.status,
+                "started_at": self.started_at,
+                "updated_at": self.updated_at,
+                "phases": {},
             }
-        self._s3.upload_json(data, self._s3_path)
-        self._last_save_time = now
+            for name, phase in self.phases.items():
+                data["phases"][name] = {
+                    "status": phase.status,
+                    "total": phase.total,
+                    "completed": phase.completed,
+                    "cursor": phase.cursor,
+                    "completed_ids": list(phase.completed_ids),
+                }
+            self._s3.upload_json(data, self._s3_path)
+            self._last_save_time = now
 
     def start_phase(self, name: str, total: int | None = None) -> None:
         if name not in self.phases:
@@ -136,11 +140,12 @@ class CheckpointManager:
         return phase in self.phases and item_id in self.phases[phase].completed_ids
 
     def mark_item_done(self, phase: str, item_id) -> None:
-        if phase not in self.phases:
-            self.phases[phase] = PhaseState(status="in_progress")
-        if item_id not in self.phases[phase].completed_ids:
-            self.phases[phase].completed_ids.add(item_id)
-            self.phases[phase].completed += 1
+        with self._lock:
+            if phase not in self.phases:
+                self.phases[phase] = PhaseState(status="in_progress")
+            if item_id not in self.phases[phase].completed_ids:
+                self.phases[phase].completed_ids.add(item_id)
+                self.phases[phase].completed += 1
 
     def set_cursor(self, phase: str, cursor: str | None) -> None:
         if phase not in self.phases:

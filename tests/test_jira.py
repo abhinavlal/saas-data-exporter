@@ -341,23 +341,6 @@ class TestAttachmentExport:
         assert resp["Body"].read() == b"PDF content here"
 
 
-class TestCsvExport:
-    @responses.activate
-    def test_generates_csv(self, s3_env):
-        mock_field_api()
-        mock_search_api([_make_issue("TEST-1")])
-
-        exporter = _make_exporter(s3_env)
-        exporter.run()
-
-        store, _, conn = s3_env
-        resp = conn.get_object(Bucket="test-bucket", Key=f"jira/{PROJECT}/tickets.csv")
-        csv_content = resp["Body"].read().decode()
-        assert "key" in csv_content
-        assert "TEST-1" in csv_content
-        assert "Custom field (CC)" in csv_content
-
-
 class TestCheckpointResume:
     @responses.activate
     def test_resume_skips_completed(self, s3_env):
@@ -398,7 +381,6 @@ class TestFullExport:
         expected = {
             f"jira/{PROJECT}/tickets/TEST-1.json",
             f"jira/{PROJECT}/tickets/_index.json",
-            f"jira/{PROJECT}/tickets.csv",
             f"jira/{PROJECT}/attachments/TEST-1/report.pdf",
             f"jira/{PROJECT}/_stats.json",
         }

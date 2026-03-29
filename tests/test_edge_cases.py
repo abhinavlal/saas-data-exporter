@@ -290,7 +290,6 @@ class TestS3Errors:
                 store.download_json("test.json")
 
 
-# ── CSV Generation Edge Cases ─────────────────────────────────────────────
 
 class TestCheckpointDefensiveness:
     def test_mark_item_done_without_start_phase(self, s3_env):
@@ -339,34 +338,6 @@ class TestSlackMalformedTimestamp:
 
         index = store.download_json("slack/CTS/messages/_index.json")
         assert len(index) == 3
-
-
-class TestCsvEdgeCases:
-    @responses.activate
-    def test_github_empty_pr_csv(self, s3_env):
-        """Empty PR list should produce an empty CSV (not error)."""
-        store, config, conn = s3_env
-        from exporters.github import GitHubExporter
-
-        responses.add(responses.GET, "https://api.github.com/repos/o/r",
-                       json={"full_name": "o/r", "topics": []}, status=200)
-        responses.add(responses.GET, "https://api.github.com/repos/o/r/languages",
-                       json={}, status=200)
-        responses.add(responses.GET, "https://api.github.com/repos/o/r/contributors",
-                       json=[], status=200)
-        responses.add(responses.GET, "https://api.github.com/repos/o/r/pulls",
-                       json=[], status=200)
-
-        exporter = GitHubExporter(
-            token="fake", repo="o/r", s3=store, config=config,
-            skip_commits=True, pr_limit=10,
-        )
-        exporter.run()
-
-        # CSV should exist but be empty content (just headers or empty)
-        resp = conn.get_object(Bucket="test-bucket", Key="github/o__r/pull_requests.csv")
-        csv_bytes = resp["Body"].read()
-        assert csv_bytes == b""  # empty CSV for no PRs
 
 
 class TestPerTargetErrorHandling:
