@@ -133,8 +133,8 @@ class GoogleWorkspaceExporter:
 
         # Step 2: batch-fetch and upload
         index_entries = []
-        for batch_start in range(0, len(message_ids), 10):
-            batch_ids = message_ids[batch_start:batch_start + 10]
+        for batch_start in range(0, len(message_ids), 50):
+            batch_ids = message_ids[batch_start:batch_start + 50]
             batch_ids = [mid for mid in batch_ids
                          if not self.checkpoint.is_item_done("gmail", mid)]
             if not batch_ids:
@@ -178,7 +178,6 @@ class GoogleWorkspaceExporter:
 
             self.stats.save()
             self.checkpoint.save()
-            time.sleep(2)  # 2s between batches
 
         # Upload index
         self.s3.upload_json(index_entries, f"{self.s3_base}/gmail/_index.json")
@@ -395,7 +394,6 @@ class GoogleWorkspaceExporter:
             self.stats.save()
             self.checkpoint.mark_item_done("drive", file_id)
             self.checkpoint.save()
-            time.sleep(0.3)
 
         self.s3.upload_json(index, f"{self.s3_base}/drive/_index.json")
         self.stats.save(force=True)
