@@ -333,9 +333,15 @@ class ConfluenceExporter:
                 media_type = att.get("mediaType", "unknown")
                 stats.add_to_map("attachments.by_media_type", media_type)
                 stats.increment("attachments.total_size_bytes", att.get("fileSize", 0))
-            except Exception:
-                log.error("Failed to download attachment %s for page %s",
-                          att_id, page_id, exc_info=True)
+            except Exception as exc:
+                # 404 is common for old/deleted attachments — warn, don't log full traceback
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 404:
+                    log.warning("Attachment not found (404): %s on page %s", filename, page_id)
+                else:
+                    log.error("Failed to download attachment %s for page %s",
+                              att_id, page_id, exc_info=True)
+                stats.increment("attachments.failed")
 
     def _list_page_attachments(self, page_id: str) -> list[dict]:
         """List attachments for a page via v2 API."""
