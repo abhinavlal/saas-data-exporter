@@ -105,7 +105,7 @@ class TestGitHubAppAuth:
 
 class TestGitHubAppPool:
     @responses.activate
-    def test_round_robin_across_apps(self, rsa_key_file):
+    def test_get_best_token_returns_valid_token(self, rsa_key_file):
         _mock_installation_token(installation_id="111", token="ghs_app1")
         _mock_installation_token(installation_id="222", token="ghs_app2")
 
@@ -113,16 +113,11 @@ class TestGitHubAppPool:
         auth2 = GitHubAppAuth("app2", rsa_key_file, "222")
         pool = GitHubAppPool([auth1, auth2])
 
-        t1 = pool.get_token()
-        t2 = pool.get_token()
-        t3 = pool.get_token()
-
-        assert t1 == "ghs_app1"
-        assert t2 == "ghs_app2"
-        assert t3 == "ghs_app1"  # wraps around
+        token = pool.get_best_token()
+        assert token in ("ghs_app1", "ghs_app2")
 
     @responses.activate
-    def test_get_auth_for_index(self, rsa_key_file):
+    def test_shifts_to_other_app_when_exhausted(self, rsa_key_file):
         _mock_installation_token(installation_id="111", token="ghs_app1")
         _mock_installation_token(installation_id="222", token="ghs_app2")
 
@@ -130,9 +125,23 @@ class TestGitHubAppPool:
         auth2 = GitHubAppAuth("app2", rsa_key_file, "222")
         pool = GitHubAppPool([auth1, auth2])
 
-        assert pool.get_auth_for_index(0).get_token() == "ghs_app1"
-        assert pool.get_auth_for_index(1).get_token() == "ghs_app2"
-        assert pool.get_auth_for_index(2).get_token() == "ghs_app1"  # wraps
+        # Mark app1 as exhausted
+        pool.update_remaining("ghs_app1", 0, time.time() + 3600)
+
+        # Should pick app2 since app1 has 0 remaining
+        token = pool.get_best_token()
+        assert token == "ghs_app2"
+
+    @responses.activate
+    def test_update_remaining_tracks_budget(self, rsa_key_file):
+        _mock_installation_token(installation_id="111", token="ghs_app1")
+
+        auth1 = GitHubAppAuth("app1", rsa_key_file, "111")
+        pool = GitHubAppPool([auth1])
+
+        pool.update_remaining("ghs_app1", 5000, time.time() + 3600)
+        # Should still return the token (has budget)
+        assert pool.get_best_token() == "ghs_app1"
 
     def test_empty_pool_raises(self):
         with pytest.raises(ValueError):
