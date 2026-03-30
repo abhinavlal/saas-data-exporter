@@ -1,6 +1,6 @@
 # Data Exporter
 
-Production-grade data exporter for GitHub, Google Workspace, Jira, and Slack. Exports structured JSON/CSV data to S3 with checkpointing, rate limiting, and parallel I/O.
+Production-grade data exporter for GitHub, Google Workspace, Jira, Slack, and Confluence. Exports structured JSON/CSV data to S3 with checkpointing, rate limiting, and parallel I/O.
 
 ## Installation
 
@@ -35,10 +35,11 @@ export AWS_DEFAULT_REGION=us-east-1
 With `.env` configured, running an exporter is just:
 
 ```bash
-uv run python -m exporters.github       # uses GITHUB_TOKEN, GITHUB_REPO, S3_BUCKET from .env
-uv run python -m exporters.jira         # uses JIRA_TOKEN, JIRA_EMAIL, JIRA_PROJECTS from .env
-uv run python -m exporters.slack        # uses SLACK_TOKEN, SLACK_CHANNEL_IDS from .env
-uv run python -m exporters.google_workspace  # uses GOOGLE_USER, GOOGLE_SERVICE_ACCOUNT_KEY from .env
+uv run python -m exporters.github            # uses GITHUB_TOKEN, GITHUB_REPOS from .env
+uv run python -m exporters.jira              # uses JIRA_TOKEN, JIRA_EMAIL, JIRA_PROJECTS from .env
+uv run python -m exporters.slack             # uses SLACK_TOKEN, SLACK_CHANNEL_IDS from .env
+uv run python -m exporters.google_workspace  # uses GOOGLE_SERVICE_ACCOUNT_KEY, GOOGLE_USERS from .env
+uv run python -m exporters.confluence        # uses JIRA_TOKEN, JIRA_EMAIL, CONFLUENCE_SPACES from .env
 ```
 
 Any setting can still be overridden on the CLI:
@@ -134,37 +135,73 @@ uv run python -m exporters.google_workspace \
 | `--skip-calendar` | false | Skip Calendar export |
 | `--skip-drive` | false | Skip Drive export |
 
+### Confluence
+
+```bash
+uv run python -m exporters.confluence \
+  --space ENG \
+  --s3-bucket my-export-bucket
+```
+
+Uses the same Atlassian credentials as Jira (falls back to `JIRA_TOKEN`/`JIRA_EMAIL`/`JIRA_DOMAIN`). By default, exports all pages in each space with comments and attachments.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--space` | required | Space key(s), repeatable |
+| `--input-csv` | | CSV file with `space` column |
+| `--s3-bucket` | required | S3 bucket name |
+| `--s3-prefix` | `""` | S3 key prefix |
+| `--page-limit` | `0` (all) | Max pages per space |
+| `--skip-comments` | `false` | Skip fetching page comments |
+| `--skip-attachments` | `false` | Skip downloading attachments |
+| `--body-format` | `storage` | Page body format: `storage` (XHTML) or `atlas_doc_format` (ADF JSON) |
+| `--parallel` | `1` | Spaces to export in parallel |
+
+Each page is fully processed (content + comments + attachments) before moving to the next, with per-page checkpointing. If interrupted, restarts resume from the saved pagination cursor.
+
 ## S3 Output Structure
 
 ```
 s3://{bucket}/{prefix}/
   github/{owner}__{repo}/
-    repo_metadata.json
-    contributors.json
-    commits.json
-    pull_requests.json
-    pull_requests.csv
-  google/{user_at_domain}/
-    gmail/{message_id}.eml
-    gmail/_index.json
-    gmail/attachments/{message_id}/{filename}
-    calendar/events.json
-    calendar/_summary.json
-    drive/{filename}
-    drive/_index.json
+    repo_metadata.json              # repo info, language breakdown
+    contributors.json               # sorted by contributions
+    commits/{sha}.json              # one file per commit
+    prs/{number}.json               # one file per PR (with reviews, comments, commits)
+    pull_requests.csv               # flat CSV summary of all PRs
+    _stats.json                     # aggregate export stats
   jira/{project}/
-    tickets.json
-    tickets.csv
-    attachments/{ticket_key}/{filename}
+    tickets/{key}.json              # one file per ticket (with comments, changelog)
+    tickets/_index.json             # {keys: [...], custom_fields: [...]}
+    tickets.csv                     # flat CSV summary
+    attachments/{key}/{filename}    # binary attachments
+    _stats.json
   slack/{channel_id}/
-    channel_info.json
-    messages.json
-    attachments/{file_id}_{filename}
+    channel_info.json               # channel metadata
+    messages/{ts}.json              # one file per message (with thread replies)
+    messages/_index.json            # array of message timestamps
+    attachments/{file_id}_{name}    # binary files
+    _stats.json
+  google/{user_at_domain}/
+    gmail/{message_id}.eml          # raw email
+    gmail/_index.json               # lightweight index with labels, size, attachments
+    gmail/attachments/{id}/{file}   # email attachments
+    calendar/events/{event_id}.json # one file per event
+    calendar/_index.json            # array of event IDs
+    drive/{filename}                # Drive files (Google Docs exported as .docx/.xlsx/.pptx)
+    drive/_index.json               # file metadata + download status
+    _stats.json
+  confluence/{space_key}/
+    pages/{page_id}.json            # page content + comments (single pass)
+    pages/_index.json               # array of page IDs
+    attachments/{page_id}/{file}    # page attachments
+    _stats.json
   _checkpoints/
     github/{owner}__{repo}.json
-    google/{user_at_domain}.json
     jira/{project}.json
     slack/{channel_id}.json
+    google/{user_at_domain}.json
+    confluence/{space_key}.json
 ```
 
 ## Checkpoint / Resume
