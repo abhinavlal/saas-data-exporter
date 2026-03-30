@@ -11,7 +11,7 @@ from lib.logging import setup_logging
 
 log = logging.getLogger(__name__)
 
-EXPORTERS = ("github", "jira", "slack", "google")
+EXPORTERS = ("github", "jira", "slack", "google", "confluence")
 
 
 class CatalogGenerator:
@@ -44,6 +44,8 @@ class CatalogGenerator:
             self._write_slack_table(by_exporter["slack"])
         if "google_workspace" in by_exporter:
             self._write_google_table(by_exporter["google_workspace"])
+        if "confluence" in by_exporter:
+            self._write_confluence_table(by_exporter["confluence"])
 
         # Cross-exporter file types table
         self._write_file_types_table(by_exporter)
@@ -232,6 +234,29 @@ class CatalogGenerator:
 
         self._upload_jsonl(rows, "catalog/google_users.jsonl")
 
+    # ── Confluence ─────────────────────────────────────────────────────────
+
+    def _write_confluence_table(self, stats_list: list[dict]) -> None:
+        rows = []
+        for s in stats_list:
+            pages = s.get("pages", {})
+            comments = s.get("comments", {})
+            attachments = s.get("attachments", {})
+
+            rows.append({
+                "target": s.get("target", ""),
+                "exported_at": s.get("exported_at", ""),
+                "total_pages": pages.get("total", 0),
+                "by_status": pages.get("by_status", {}),
+                "total_comments": comments.get("total", 0),
+                "pages_with_comments": comments.get("pages_with_comments", 0),
+                "total_attachments": attachments.get("total", 0),
+                "total_attachment_size_bytes": attachments.get("total_size_bytes", 0),
+                "attachments_by_media_type": attachments.get("by_media_type", {}),
+            })
+
+        self._upload_jsonl(rows, "catalog/confluence_spaces.jsonl")
+
     # ── File Types (cross-exporter) ───────────────────────────────────────
 
     def _write_file_types_table(self, by_exporter: dict[str, list[dict]]) -> None:
@@ -257,6 +282,12 @@ class CatalogGenerator:
             for mime, count in s.get("attachments", {}).get("by_mime_type", {}).items():
                 rows.append({"exporter": "jira", "target": target,
                              "category": "ticket_attachment", "file_type": mime, "count": count})
+
+        for s in by_exporter.get("confluence", []):
+            target = s.get("target", "")
+            for mime, count in s.get("attachments", {}).get("by_media_type", {}).items():
+                rows.append({"exporter": "confluence", "target": target,
+                             "category": "page_attachment", "file_type": mime, "count": count})
 
         if rows:
             self._upload_jsonl(rows, "catalog/file_types.jsonl")
@@ -302,6 +333,15 @@ class CatalogGenerator:
                 "total_drive_files": sum(s.get("drive", {}).get("total_files", 0) for s in google),
             }
 
+        confluence = by_exporter.get("confluence", [])
+        if confluence:
+            summary["confluence"] = {
+                "spaces": len(confluence),
+                "total_pages": sum(s.get("pages", {}).get("total", 0) for s in confluence),
+                "total_comments": sum(s.get("comments", {}).get("total", 0) for s in confluence),
+                "total_attachments": sum(s.get("attachments", {}).get("total", 0) for s in confluence),
+            }
+
         if self.dry_run:
             log.info("[DRY RUN] Summary: %s", json.dumps(summary, indent=2))
             return
@@ -318,7 +358,7 @@ def main():
     parser = argparse.ArgumentParser(description="Generate Athena-queryable catalog from export stats")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
-    parser.add_argument("--exporter", choices=["github", "jira", "slack", "google"],
+    parser.add_argument("--exporter", choices=["github", "jira", "slack", "google", "confluence"],
                         help="Only process a specific exporter")
     parser.add_argument("--dry-run", action="store_true", help="Print summary without writing to S3")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
