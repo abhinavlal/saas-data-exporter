@@ -138,7 +138,7 @@ def _make_attachment(att_id, filename, media_type="application/pdf", size=1024):
         "title": filename,
         "mediaType": media_type,
         "fileSize": size,
-        "_links": {"download": f"/wiki/download/attachments/101/{filename}"},
+        "_links": {"download": f"/download/attachments/101/{filename}"},
     }
 
 
