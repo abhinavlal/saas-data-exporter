@@ -291,7 +291,7 @@ class GitHubExporter:
             log.warning("Commit %s not found (404)", sha)
             return None
         if resp.status_code == 403:
-            log.warning("Commit %s forbidden (403) — token may lack repo access", sha)
+            self._log_403(resp, f"Commit {sha}")
             return None
         resp.raise_for_status()
         c = resp.json()
@@ -331,6 +331,20 @@ class GitHubExporter:
             "files": files,
             "html_url": c.get("html_url"),
         }
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _log_403(resp, context: str) -> None:
+        """Log a 403 with the correct reason — rate limit vs permission."""
+        try:
+            msg = resp.json().get("message", "")
+        except Exception:
+            msg = ""
+        if "rate limit" in msg.lower():
+            log.warning("%s — rate limit exceeded (403), will retry after reset", context)
+        else:
+            log.warning("%s — forbidden (403), token may lack access", context)
 
     # ── Pull Requests ─────────────────────────────────────────────────────
 
@@ -401,7 +415,7 @@ class GitHubExporter:
             log.warning("PR #%d not found (404)", number)
             return None
         if resp.status_code == 403:
-            log.warning("PR #%d forbidden (403) — token may lack repo access", number)
+            self._log_403(resp, f"PR #{number}")
             return None
         resp.raise_for_status()
         pr = resp.json()
