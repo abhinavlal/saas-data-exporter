@@ -102,6 +102,21 @@ CREATE EXTERNAL TABLE IF NOT EXISTS data_export_catalog.google_users (
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
 LOCATION 's3://{BUCKET}/{PREFIX}/catalog/google_users/';
 
+-- Confluence spaces inventory
+CREATE EXTERNAL TABLE IF NOT EXISTS data_export_catalog.confluence_spaces (
+  target STRING,
+  exported_at STRING,
+  total_pages INT,
+  by_status MAP<STRING, INT>,
+  total_comments INT,
+  pages_with_comments INT,
+  total_attachments INT,
+  total_attachment_size_bytes BIGINT,
+  attachments_by_media_type MAP<STRING, INT>
+)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+LOCATION 's3://{BUCKET}/{PREFIX}/catalog/confluence_spaces/';
+
 -- Cross-exporter file type breakdown
 CREATE EXTERNAL TABLE IF NOT EXISTS data_export_catalog.file_types (
   exporter STRING,
