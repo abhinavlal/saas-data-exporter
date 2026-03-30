@@ -1,5 +1,6 @@
 # Environment and secrets
 .env
+*.pem
 *.json.key
 service-account.json
 
