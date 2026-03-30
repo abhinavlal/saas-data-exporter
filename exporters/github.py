@@ -30,6 +30,7 @@ class GitHubExporter:
         skip_commits: bool = True,
         skip_prs: bool = False,
         commit_details: bool = False,
+        app_auth=None,
     ):
         self.repo = repo
         self.s3 = s3
@@ -40,19 +41,28 @@ class GitHubExporter:
         self.skip_commits = skip_commits
         self.skip_prs = skip_prs
         self.commit_details = commit_details
+        self._app_auth = app_auth
 
         self.session, self.rate_state = make_session(
             requests_per_second=10,
             burst=20,
             min_remaining=50,
         )
-        self.session.headers["Authorization"] = f"Bearer {token}"
+        if app_auth:
+            self.session.headers["Authorization"] = f"Bearer {app_auth.get_token()}"
+        else:
+            self.session.headers["Authorization"] = f"Bearer {token}"
         self.session.headers["Accept"] = "application/vnd.github+json"
 
         self.repo_slug = repo.replace("/", "__")
         self.s3_base = f"github/{self.repo_slug}"
         self.checkpoint = CheckpointManager(s3, f"github/{self.repo_slug}")
         self.stats = StatsCollector(s3, f"{self.s3_base}/_stats.json")
+
+    def _refresh_token_if_needed(self) -> None:
+        """Refresh the session token if using GitHub App auth (tokens expire hourly)."""
+        if self._app_auth:
+            self.session.headers["Authorization"] = f"Bearer {self._app_auth.get_token()}"
 
     def run(self):
         self.checkpoint.load()
@@ -63,15 +73,19 @@ class GitHubExporter:
         log.info("Starting GitHub export for %s", self.repo)
 
         if not self.checkpoint.is_phase_done("metadata"):
+            self._refresh_token_if_needed()
             self._export_metadata()
 
         if not self.checkpoint.is_phase_done("contributors"):
+            self._refresh_token_if_needed()
             self._export_contributors()
 
         if not self.skip_commits and not self.checkpoint.is_phase_done("commits"):
+            self._refresh_token_if_needed()
             self._export_commits()
 
         if not self.skip_prs and not self.checkpoint.is_phase_done("pull_requests"):
+            self._refresh_token_if_needed()
             self._export_pull_requests()
 
         self.checkpoint.complete()
@@ -559,38 +573,49 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Export GitHub repository data to S3")
-    parser.add_argument("--token", default=env("GITHUB_TOKEN"), help="GitHub PAT (or comma-separated list for round-robin)")
+    parser.add_argument("--token", default=env("GITHUB_TOKEN"),
+                        help="GitHub PAT (or comma-separated list for round-robin)")
     parser.add_argument("--repo", nargs="+", help="Repository(s) in owner/repo format")
-    parser.add_argument("--input-csv", default=env("GITHUB_INPUT_CSV"), help="CSV file with 'repo' column")
+    parser.add_argument("--input-csv", default=env("GITHUB_INPUT_CSV"),
+                        help="CSV file with 'repo' column")
     parser.add_argument("--s3-bucket", default=env("S3_BUCKET"))
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""))
-    parser.add_argument("--pr-limit", type=int, default=env_int("GITHUB_PR_LIMIT", 0), help="Max PRs (0=all)")
-    parser.add_argument("--pr-state", default=env("GITHUB_PR_STATE", "all"), choices=["open", "closed", "all"])
-    parser.add_argument("--commit-limit", type=int, default=env_int("GITHUB_COMMIT_LIMIT", 0), help="Max commits (0=all)")
-    parser.add_argument("--skip-commits", action="store_true", default=env_bool("GITHUB_SKIP_COMMITS", True))
-    parser.add_argument("--include-commits", action="store_true", default=env_bool("GITHUB_INCLUDE_COMMITS"),
+    parser.add_argument("--pr-limit", type=int, default=env_int("GITHUB_PR_LIMIT", 0),
+                        help="Max PRs (0=all)")
+    parser.add_argument("--pr-state", default=env("GITHUB_PR_STATE", "all"),
+                        choices=["open", "closed", "all"])
+    parser.add_argument("--commit-limit", type=int, default=env_int("GITHUB_COMMIT_LIMIT", 0),
+                        help="Max commits (0=all)")
+    parser.add_argument("--skip-commits", action="store_true",
+                        default=env_bool("GITHUB_SKIP_COMMITS", True))
+    parser.add_argument("--include-commits", action="store_true",
+                        default=env_bool("GITHUB_INCLUDE_COMMITS"),
                         help="Include commit export (off by default)")
-    parser.add_argument("--skip-prs", action="store_true", default=env_bool("GITHUB_SKIP_PRS"))
-    parser.add_argument("--commit-details", action="store_true", default=env_bool("GITHUB_COMMIT_DETAILS"),
-                        help="Fetch full commit details (stats, files, patches) — 1 API call per commit")
+    parser.add_argument("--skip-prs", action="store_true",
+                        default=env_bool("GITHUB_SKIP_PRS"))
+    parser.add_argument("--commit-details", action="store_true",
+                        default=env_bool("GITHUB_COMMIT_DETAILS"),
+                        help="Fetch full commit details (stats, files, patches)")
+    # GitHub App auth (higher rate limits)
+    parser.add_argument("--app-id", default=env("GITHUB_APP_ID"),
+                        help="GitHub App ID (comma-separated for multiple apps)")
+    parser.add_argument("--app-key", default=env("GITHUB_APP_PRIVATE_KEY"),
+                        help="Path to private key .pem (comma-separated for multiple apps)")
+    parser.add_argument("--app-installation-id", default=env("GITHUB_APP_INSTALLATION_ID"),
+                        help="Installation ID (comma-separated for multiple apps)")
     parser.add_argument("--parallel", type=int, default=env_int("GITHUB_PARALLEL", 4),
-                        help="Repos to export in parallel (default 4, use multiple PATs for independent rate limits)")
+                        help="Repos to export in parallel")
     parser.add_argument("--max-workers", type=int, default=env_int("MAX_WORKERS", 10),
-                        help="Parallel PR/commit detail fetches per repo (default 10, throttled by TokenBucket)")
+                        help="Parallel PR/commit detail fetches per repo")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
-    parser.add_argument("--no-json-logs", action="store_true", default=not env_bool("JSON_LOGS", True))
-    parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"), help="Directory for log files")
+    parser.add_argument("--no-json-logs", action="store_true",
+                        default=not env_bool("JSON_LOGS", True))
+    parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"),
+                        help="Directory for log files")
     args = parser.parse_args()
 
-    if not args.token:
-        parser.error("--token is required (or set GITHUB_TOKEN)")
     if not args.s3_bucket:
         parser.error("--s3-bucket is required (or set S3_BUCKET)")
-
-    # Support multiple PATs: comma-separated in --token or GITHUB_TOKENS env var
-    tokens = [t.strip() for t in args.token.split(",") if t.strip()]
-    if not tokens:
-        tokens = env_list("GITHUB_TOKENS") or [args.token]
 
     # --include-commits overrides --skip-commits
     if args.include_commits:
@@ -605,6 +630,26 @@ def main():
     if not repos:
         parser.error("--repo or --input-csv is required (or set GITHUB_REPOS)")
 
+    # Determine auth method: GitHub App (preferred) or PAT (fallback)
+    app_pool = None
+    if args.app_id and args.app_key and args.app_installation_id:
+        from lib.github_auth import GitHubAppAuth, GitHubAppPool
+        app_ids = [x.strip() for x in args.app_id.split(",")]
+        app_keys = [x.strip() for x in args.app_key.split(",")]
+        app_installs = [x.strip() for x in args.app_installation_id.split(",")]
+        if len(app_ids) != len(app_keys) or len(app_ids) != len(app_installs):
+            parser.error("--app-id, --app-key, and --app-installation-id must have the same number of comma-separated values")
+        apps = [GitHubAppAuth(app_id=aid, private_key_path=key, installation_id=iid)
+                for aid, key, iid in zip(app_ids, app_keys, app_installs)]
+        app_pool = GitHubAppPool(apps)
+    elif not args.token:
+        parser.error("--token or GitHub App config (--app-id, --app-key, --app-installation-id) is required")
+
+    # PAT tokens (fallback)
+    tokens = []
+    if args.token:
+        tokens = [t.strip() for t in args.token.split(",") if t.strip()]
+
     log_file = os.path.join(args.log_dir, "github.log")
     setup_logging(level=args.log_level, json_output=not args.no_json_logs, log_file=log_file)
     s3 = S3Store(bucket=args.s3_bucket, prefix=args.s3_prefix)
@@ -615,10 +660,14 @@ def main():
         log_level=args.log_level,
     )
 
-    def _export_one_repo(repo: str, token: str) -> None:
+    def _export_one_repo(repo: str, index: int) -> None:
         log.info("Exporting repo %s", repo)
+        # GitHub App auth: each repo gets a dedicated app (round-robin)
+        # PAT auth: round-robin across tokens
+        repo_app_auth = app_pool.get_auth_for_index(index) if app_pool else None
+        repo_token = tokens[index % len(tokens)] if tokens and not app_pool else ""
         exporter = GitHubExporter(
-            token=token,
+            token=repo_token,
             repo=repo,
             s3=s3,
             config=config,
@@ -628,14 +677,15 @@ def main():
             skip_commits=args.skip_commits,
             skip_prs=args.skip_prs,
             commit_details=args.commit_details,
+            app_auth=repo_app_auth,
         )
         exporter.run()
 
+    auth_desc = f"{len(app_pool)} GitHub Apps" if app_pool else f"{len(tokens)} PATs"
     failed = []
-    log.info("Exporting %d repos (%d in parallel, %d PATs)", len(repos), args.parallel, len(tokens))
+    log.info("Exporting %d repos (%d in parallel, %s)", len(repos), args.parallel, auth_desc)
     with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        # Round-robin tokens across repos — each repo gets its own rate limit bucket
-        futures = {pool.submit(_export_one_repo, r, tokens[i % len(tokens)]): r
+        futures = {pool.submit(_export_one_repo, r, i): r
                    for i, r in enumerate(repos)}
         for future in as_completed(futures):
             repo = futures[future]
