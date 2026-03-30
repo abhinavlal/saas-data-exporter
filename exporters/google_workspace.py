@@ -127,104 +127,117 @@ class GoogleWorkspaceExporter:
         self.checkpoint.start_phase("gmail", total=self.email_limit or None)
         service = self._build_service("gmail", "v1")
 
-        # Step 1: list message IDs
-        message_ids = self._list_gmail_ids(service)
-        log.info("Found %d Gmail message IDs", len(message_ids))
+        # Resume: load existing index entries from S3
+        index_entries = self.s3.download_json(f"{self.s3_base}/gmail/_index.json") or []
 
-        # Step 2: batch-fetch and upload
-        index_entries = []
-        for batch_start in range(0, len(message_ids), 50):
-            batch_ids = message_ids[batch_start:batch_start + 50]
-            batch_ids = [mid for mid in batch_ids
-                         if not self.checkpoint.is_item_done("gmail", mid)]
-            if not batch_ids:
-                continue
+        # Stream pages — process each page of IDs immediately instead of
+        # listing all IDs upfront. Saves memory and starts work instantly.
+        total_processed = len(index_entries)  # account for already-exported on resume
+        last_logged = total_processed
+        page_token = self.checkpoint.get_cursor("gmail_page")
 
-            raw_messages = self._batch_fetch_raw(service, batch_ids)
-
-            # Parallel upload of .eml files and attachment extraction
-            with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-                futures = []
-                for msg_id, msg_data in raw_messages.items():
-                    futures.append(pool.submit(self._save_eml_to_s3, msg_id, msg_data))
-                    futures.append(pool.submit(self._extract_and_upload_attachments, msg_id, msg_data))
-                for f in as_completed(futures):
-                    try:
-                        f.result()
-                    except Exception:
-                        log.error("Gmail upload error", exc_info=True)
-
-            # Build index entries and mark done
-            for msg_id, msg_data in raw_messages.items():
-                try:
-                    entry = self._build_index_entry(msg_id, msg_data)
-                    index_entries.append(entry)
-
-                    # Accumulate gmail stats from index entry
-                    self.stats.increment("gmail.total_messages")
-                    self.stats.increment("gmail.total_size_bytes", entry.get("sizeEstimate") or 0)
-                    for label in entry.get("labelIds", []):
-                        self.stats.add_to_map("gmail.labels", label)
-                    attachments = entry.get("attachments", [])
-                    if attachments:
-                        self.stats.increment("gmail.messages_with_attachments")
-                    for fname in attachments:
-                        self.stats.increment("gmail.total_attachments")
-                        ext = ("." + fname.rsplit(".", 1)[-1]).lower() if "." in fname else ".unknown"
-                        self.stats.add_to_map("gmail.attachments_by_extension", ext)
-                except Exception:
-                    log.error("Failed to build index for message %s", msg_id, exc_info=True)
-                self.checkpoint.mark_item_done("gmail", msg_id)
-
-            self.stats.save()
-            self.checkpoint.save()
-
-        # Upload index
-        self.s3.upload_json(index_entries, f"{self.s3_base}/gmail/_index.json")
-        self.stats.save(force=True)
-        self.checkpoint.complete_phase("gmail")
-        self.checkpoint.save(force=True)
-        log.info("Exported %d Gmail messages", len(index_entries))
-
-    def _list_gmail_ids(self, service) -> list[str]:
-        ids = []
-        page_token = None
         while True:
             batch_size = 100
             if self.email_limit:
-                batch_size = min(100, self.email_limit - len(ids))
-                if batch_size <= 0:
+                remaining = self.email_limit - total_processed
+                if remaining <= 0:
                     break
+                batch_size = min(100, remaining)
+
             resp = service.users().messages().list(
                 userId="me",
                 maxResults=batch_size,
                 pageToken=page_token,
                 quotaUser=self.user,
             ).execute()
-            for msg in resp.get("messages", []):
-                ids.append(msg["id"])
-                if self.email_limit and len(ids) >= self.email_limit:
-                    return ids
+
+            page_msgs = resp.get("messages", [])
+            msg_ids = [m["id"] for m in page_msgs
+                       if not self.checkpoint.is_item_done("gmail", m["id"])]
+
+            if msg_ids:
+                # Parallel fetch — 10 concurrent messages.get calls
+                raw_messages = self._parallel_fetch_raw(service, msg_ids)
+
+                # Parallel upload of .eml files and attachment extraction
+                with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+                    futures = []
+                    for msg_id, msg_data in raw_messages.items():
+                        futures.append(pool.submit(self._save_eml_to_s3, msg_id, msg_data))
+                        futures.append(pool.submit(self._extract_and_upload_attachments, msg_id, msg_data))
+                    for f in as_completed(futures):
+                        try:
+                            f.result()
+                        except Exception:
+                            log.error("Gmail upload error", exc_info=True)
+
+                # Build index entries and mark done
+                for msg_id, msg_data in raw_messages.items():
+                    try:
+                        entry = self._build_index_entry(msg_id, msg_data)
+                        index_entries.append(entry)
+                        self._accumulate_gmail_stats(entry)
+                    except Exception:
+                        log.error("Failed to build index for message %s", msg_id, exc_info=True)
+                    self.checkpoint.mark_item_done("gmail", msg_id)
+
+            total_processed += len(msg_ids)
             page_token = resp.get("nextPageToken")
+            self.checkpoint.set_cursor("gmail_page", page_token)
+            self.stats.save()
+            self.checkpoint.save()
+
             if not page_token:
                 break
-        return ids
+            if self.email_limit and total_processed >= self.email_limit:
+                break
 
-    @retry(max_attempts=5, backoff_base=2.0, exceptions=(HttpError,))
-    def _batch_fetch_raw(self, service, msg_ids: list[str]) -> dict[str, dict]:
-        """Fetch raw messages via individual API calls (batch API is complex with googleapiclient)."""
+            if total_processed - last_logged >= 1000:
+                log.info("Gmail progress for %s: %d messages processed", self.user, total_processed)
+                last_logged = total_processed
+
+        # Upload index
+        self.s3.upload_json(index_entries, f"{self.s3_base}/gmail/_index.json")
+        self.stats.save(force=True)
+        self.checkpoint.complete_phase("gmail")
+        self.checkpoint.save(force=True)
+        log.info("Exported %d Gmail messages for %s", total_processed, self.user)
+
+    def _accumulate_gmail_stats(self, entry: dict) -> None:
+        self.stats.increment("gmail.total_messages")
+        self.stats.increment("gmail.total_size_bytes", entry.get("sizeEstimate") or 0)
+        for label in entry.get("labelIds", []):
+            self.stats.add_to_map("gmail.labels", label)
+        attachments = entry.get("attachments", [])
+        if attachments:
+            self.stats.increment("gmail.messages_with_attachments")
+        for fname in attachments:
+            self.stats.increment("gmail.total_attachments")
+            ext = ("." + fname.rsplit(".", 1)[-1]).lower() if "." in fname else ".unknown"
+            self.stats.add_to_map("gmail.attachments_by_extension", ext)
+
+    def _parallel_fetch_raw(self, service, msg_ids: list[str]) -> dict[str, dict]:
+        """Fetch raw messages with 10 concurrent API calls and per-message retry."""
         results = {}
-        for msg_id in msg_ids:
-            try:
-                msg = service.users().messages().get(
-                    userId="me", id=msg_id, format="raw",
-                    quotaUser=self.user,
-                ).execute()
-                results[msg_id] = msg
-            except HttpError as e:
-                if e.resp.status in (429, 500, 503):
-                    raise  # retry decorator handles these
-                log.warning("Failed to fetch message %s: %s", msg_id, e)
+
+        @retry(max_attempts=5, backoff_base=2.0, exceptions=(HttpError,))
+        def _fetch_one(msg_id):
+            msg = service.users().messages().get(
+                userId="me", id=msg_id, format="raw",
+                quotaUser=self.user,
+            ).execute()
+            return msg_id, msg
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_fetch_one, mid): mid for mid in msg_ids}
+            for future in as_completed(futures):
+                msg_id = futures[future]
+                try:
+                    _, msg_data = future.result()
+                    results[msg_id] = msg_data
+                except Exception:
+                    log.warning("Failed to fetch message %s after retries", msg_id, exc_info=True)
+
         return results
 
     def _save_eml_to_s3(self, msg_id: str, msg_data: dict) -> None:
