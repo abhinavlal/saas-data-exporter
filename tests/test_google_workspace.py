@@ -65,7 +65,7 @@ def _mock_gmail_service(message_ids, raw_messages):
     # messages().get() — return different messages based on id
     def get_side_effect(*args, **kwargs):
         mock_req = MagicMock()
-        msg_id = kwargs.get("id") or args[0] if args else None
+        msg_id = kwargs.get("id") or (args[0] if args else None)
         # Handle the chained call pattern
         mock_req.execute.return_value = raw_messages.get(msg_id, {})
         return mock_req
@@ -140,9 +140,10 @@ class TestGmailExport:
             "snippet": "Test body", "internalDate": "1700000000000",
             "sizeEstimate": 500, "raw": raw_email,
         }
+        gmail_service = _mock_gmail_service(["msg1"], {"msg1": msg1_data})
 
         with patch("exporters.google_workspace.build") as mock_build:
-            mock_build.return_value = MagicMock()
+            mock_build.return_value = gmail_service
 
             from exporters.google_workspace import GoogleWorkspaceExporter
             exporter = GoogleWorkspaceExporter(
@@ -150,9 +151,6 @@ class TestGmailExport:
                 s3=store, config=config,
                 email_limit=10, skip_calendar=True, skip_drive=True,
             )
-            # Mock internal methods directly for reliable testing
-            exporter._list_gmail_ids = MagicMock(return_value=["msg1"])
-            exporter._batch_fetch_raw = MagicMock(return_value={"msg1": msg1_data})
             exporter.run()
 
         # Check .eml file exists
@@ -178,9 +176,10 @@ class TestGmailExport:
             "internalDate": "1700000000000", "sizeEstimate": 1000,
             "raw": raw_email,
         }
+        gmail_service = _mock_gmail_service(["msg2"], {"msg2": msg2_data})
 
         with patch("exporters.google_workspace.build") as mock_build:
-            mock_build.return_value = MagicMock()
+            mock_build.return_value = gmail_service
 
             from exporters.google_workspace import GoogleWorkspaceExporter
             exporter = GoogleWorkspaceExporter(
@@ -188,8 +187,6 @@ class TestGmailExport:
                 s3=store, config=config,
                 email_limit=10, skip_calendar=True, skip_drive=True,
             )
-            exporter._list_gmail_ids = MagicMock(return_value=["msg2"])
-            exporter._batch_fetch_raw = MagicMock(return_value={"msg2": msg2_data})
             exporter.run()
 
         # Check attachment uploaded
