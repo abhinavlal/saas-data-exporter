@@ -143,7 +143,7 @@ def make_session(
     retry_strategy = Retry(
         total=max_retries_on_error,
         backoff_factor=1.0,
-        status_forcelist=[500, 502, 503],
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET", "POST", "PUT"],
     )
 
