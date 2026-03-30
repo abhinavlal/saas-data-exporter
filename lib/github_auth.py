@@ -3,7 +3,7 @@
 Provides higher API rate limits than PATs:
 - PAT: 5,000 requests/hour (per user, shared across all tokens)
 - GitHub App: 5,000–12,500 requests/hour per installation (independent pool)
-- Multiple Apps: each gets its own pool — 2 apps = up to 25,000 req/hr
+- Multiple Apps: each gets its own pool — 4 apps = up to 50,000 req/hr
 
 Usage::
 
@@ -14,9 +14,10 @@ Usage::
     )
     token = auth.get_token()   # auto-refreshes when near expiry
 
-    # Multiple apps for round-robin:
-    pool = GitHubAppPool([auth1, auth2])
-    token = pool.get_token()   # rotates across apps
+    # Multiple apps — shared pool picks the best token per request:
+    pool = GitHubAppPool([auth1, auth2, auth3, auth4])
+    token = pool.get_best_token()  # picks app with most remaining budget
+    pool.update_remaining(token, remaining, reset)  # feed back rate limit headers
 """
 
 import logging
@@ -96,31 +97,91 @@ class GitHubAppAuth:
 
 
 class GitHubAppPool:
-    """Round-robin pool of GitHub App installations for multiplied rate limits.
+    """Shared pool of GitHub App installations that picks the best token
+    per request based on remaining rate limit budget.
 
-    Each app has its own independent rate limit pool (up to 12,500 req/hr),
-    so N apps = N × 12,500 req/hr throughput.
+    Each app has its own independent rate limit pool (up to 12,500 req/hr).
+    The pool tracks remaining budget from ``X-RateLimit-Remaining`` headers
+    and routes each request to the app with the most headroom.  When an app
+    is exhausted, requests seamlessly shift to other apps — no idle budget.
+
+    Thread-safe: multiple exporter threads call ``get_best_token()``
+    and ``update_remaining()`` concurrently.
     """
 
     def __init__(self, apps: list[GitHubAppAuth]):
         if not apps:
             raise ValueError("At least one GitHubAppAuth is required")
         self._apps = apps
-        self._index = 0
         self._lock = threading.Lock()
+        # Track remaining budget per app: token_str -> remaining count
+        self._remaining: dict[str, int] = {}
+        # Track reset time per app: token_str -> reset timestamp
+        self._reset_at: dict[str, float] = {}
+        # Map token_str back to app for logging
+        self._token_to_app: dict[str, GitHubAppAuth] = {}
 
-    def get_token(self, index: int | None = None) -> str:
-        """Get a token from a specific app (by index) or round-robin."""
-        if index is not None:
-            return self._apps[index % len(self._apps)].get_token()
+    def get_best_token(self) -> str:
+        """Return the token with the most remaining budget.
+
+        On first call for each app (before any headers are seen), assumes
+        full budget (12,500).  Thread-safe.
+        """
         with self._lock:
-            app = self._apps[self._index % len(self._apps)]
-            self._index += 1
-        return app.get_token()
+            best_token = None
+            best_remaining = -1
+
+            now = time.time()
+            for app in self._apps:
+                token = app.get_token()
+                self._token_to_app[token] = app
+
+                remaining = self._remaining.get(token, 12500)
+                reset_at = self._reset_at.get(token, 0)
+
+                # If past reset time, assume budget is restored
+                if remaining <= 0 and now > reset_at:
+                    remaining = 12500
+                    self._remaining[token] = remaining
+
+                if remaining > best_remaining:
+                    best_remaining = remaining
+                    best_token = token
+
+            # Optimistic decrement — actual value updated by update_remaining()
+            if best_token and best_remaining > 0:
+                self._remaining[best_token] = best_remaining - 1
+
+            if best_token:
+                return best_token
+
+        # Fallback: all exhausted, return the one that resets soonest
+        return self._get_soonest_reset_token()
+
+    def update_remaining(self, token: str, remaining: int,
+                         reset: float | None = None) -> None:
+        """Update the tracked remaining budget for an app from response headers.
+
+        Call this after every API response with the ``X-RateLimit-Remaining``
+        and ``X-RateLimit-Reset`` header values.
+        """
+        with self._lock:
+            self._remaining[token] = remaining
+            if reset is not None:
+                self._reset_at[token] = reset
+
+    def _get_soonest_reset_token(self) -> str:
+        """When all apps are exhausted, return the one that resets soonest."""
+        with self._lock:
+            soonest_token = None
+            soonest_reset = float("inf")
+            for app in self._apps:
+                token = app.get_token()
+                reset = self._reset_at.get(token, 0)
+                if reset < soonest_reset:
+                    soonest_reset = reset
+                    soonest_token = token
+            return soonest_token or self._apps[0].get_token()
 
     def __len__(self) -> int:
         return len(self._apps)
-
-    def get_auth_for_index(self, index: int) -> 'GitHubAppAuth':
-        """Get a specific app auth instance for dedicated use by a repo."""
-        return self._apps[index % len(self._apps)]

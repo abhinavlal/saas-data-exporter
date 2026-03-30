@@ -33,7 +33,7 @@ class GitHubExporter:
         skip_commits: bool = True,
         skip_prs: bool = False,
         commit_details: bool = False,
-        app_auth=None,
+        app_pool=None,
     ):
         self.repo = repo
         self.s3 = s3
@@ -44,15 +44,17 @@ class GitHubExporter:
         self.skip_commits = skip_commits
         self.skip_prs = skip_prs
         self.commit_details = commit_details
-        self._app_auth = app_auth
+        self._app_pool = app_pool
+        self._pat_token = token
 
         self.session, self.rate_state = make_session(
             requests_per_second=10,
             burst=20,
             min_remaining=50,
         )
-        if app_auth:
-            self.session.headers["Authorization"] = f"Bearer {app_auth.get_token()}"
+        if app_pool:
+            # Token set per-request in _api_get()
+            pass
         else:
             self.session.headers["Authorization"] = f"Bearer {token}"
         self.session.headers["Accept"] = "application/vnd.github+json"
@@ -63,9 +65,8 @@ class GitHubExporter:
         self.stats = StatsCollector(s3, f"{self.s3_base}/_stats.json")
 
     def _refresh_token_if_needed(self) -> None:
-        """Refresh the session token if using GitHub App auth (tokens expire hourly)."""
-        if self._app_auth:
-            self.session.headers["Authorization"] = f"Bearer {self._app_auth.get_token()}"
+        """No-op for pool mode (token set per-request). For PAT mode, nothing to refresh."""
+        pass
 
     def run(self):
         self.checkpoint.load()
@@ -338,17 +339,55 @@ class GitHubExporter:
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _api_get(self, url: str, **kwargs) -> requests.Response:
-        """GET with rate-limit 403 retry.  Waits and retries once on rate
-        limit exhaustion instead of crashing."""
+        """GET with per-request token selection and rate-limit 403 retry.
+
+        In pool mode: picks the app with the most remaining budget before
+        each request, and feeds rate limit headers back to the pool.
+        On rate limit 403: switches to next best app and retries immediately.
+        """
+        token = self._pick_token()
+        self.session.headers["Authorization"] = f"Bearer {token}"
         resp = self.session.get(url, **kwargs)
-        if resp.status_code == 403:
-            if self._is_rate_limited(resp):
-                wait = self._rate_limit_wait(resp)
-                log.warning("Rate limit exceeded, waiting %ds before retry", wait)
-                time.sleep(wait)
-                self._refresh_token_if_needed()
+        self._feed_back_rate_limit(token, resp)
+
+        if resp.status_code == 403 and self._is_rate_limited(resp):
+            if self._app_pool:
+                # Try another app immediately
+                token = self._pick_token()
+                self.session.headers["Authorization"] = f"Bearer {token}"
                 resp = self.session.get(url, **kwargs)
+                self._feed_back_rate_limit(token, resp)
+
+            # If still rate limited (all apps exhausted), wait for reset
+            if resp.status_code == 403 and self._is_rate_limited(resp):
+                wait = self._rate_limit_wait(resp)
+                log.warning("All tokens exhausted, waiting %ds for reset", wait)
+                time.sleep(wait)
+                token = self._pick_token()
+                self.session.headers["Authorization"] = f"Bearer {token}"
+                resp = self.session.get(url, **kwargs)
+                self._feed_back_rate_limit(token, resp)
+
         return resp
+
+    def _pick_token(self) -> str:
+        """Pick the best available token (pool mode) or return PAT."""
+        if self._app_pool:
+            return self._app_pool.get_best_token()
+        return self._pat_token
+
+    def _feed_back_rate_limit(self, token: str, resp: requests.Response) -> None:
+        """Update the pool's budget tracking from response headers."""
+        if not self._app_pool:
+            return
+        remaining = resp.headers.get("X-RateLimit-Remaining")
+        reset = resp.headers.get("X-RateLimit-Reset")
+        if remaining is not None:
+            self._app_pool.update_remaining(
+                token,
+                int(remaining),
+                float(reset) if reset else None,
+            )
 
     @staticmethod
     def _is_rate_limited(resp) -> bool:
@@ -708,9 +747,6 @@ def main():
 
     def _export_one_repo(repo: str, index: int) -> None:
         log.info("Exporting repo %s", repo)
-        # GitHub App auth: each repo gets a dedicated app (round-robin)
-        # PAT auth: round-robin across tokens
-        repo_app_auth = app_pool.get_auth_for_index(index) if app_pool else None
         repo_token = tokens[index % len(tokens)] if tokens and not app_pool else ""
         exporter = GitHubExporter(
             token=repo_token,
@@ -723,7 +759,7 @@ def main():
             skip_commits=args.skip_commits,
             skip_prs=args.skip_prs,
             commit_details=args.commit_details,
-            app_auth=repo_app_auth,
+            app_pool=app_pool,
         )
         exporter.run()
 
