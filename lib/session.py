@@ -48,7 +48,12 @@ class RateLimitState:
         When remaining is 0: wait until full reset.
         When remaining < min_remaining: spread remaining requests across the
         remaining window to avoid bursting into a wall.
+
+        Pass min_remaining < 0 to disable all preemptive waiting (used when
+        an external token pool manages rate limits across multiple tokens).
         """
+        if min_remaining < 0:
+            return None
         with self._lock:
             if self.remaining is None or self.reset_at is None:
                 return None
