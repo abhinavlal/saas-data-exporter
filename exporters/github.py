@@ -3,7 +3,10 @@
 import argparse
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 from lib.s3 import S3Store
 from lib.checkpoint import CheckpointManager
@@ -100,12 +103,12 @@ class GitHubExporter:
         log.info("Exporting repository metadata")
         self.checkpoint.start_phase("metadata")
 
-        resp = self.session.get(f"{API_BASE}/repos/{self.repo}")
+        resp = self._api_get(f"{API_BASE}/repos/{self.repo}")
         resp.raise_for_status()
         repo_data = resp.json()
 
         # Language breakdown
-        lang_resp = self.session.get(f"{API_BASE}/repos/{self.repo}/languages")
+        lang_resp = self._api_get(f"{API_BASE}/repos/{self.repo}/languages")
         lang_resp.raise_for_status()
         languages = lang_resp.json()
 
@@ -159,7 +162,7 @@ class GitHubExporter:
         contributors = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/contributors",
                 params={"per_page": 100, "page": page},
             )
@@ -252,7 +255,7 @@ class GitHubExporter:
         commits = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/commits",
                 params={"per_page": 100, "page": page},
             )
@@ -286,7 +289,7 @@ class GitHubExporter:
         return commits
 
     def _fetch_commit_detail(self, sha: str) -> dict | None:
-        resp = self.session.get(f"{API_BASE}/repos/{self.repo}/commits/{sha}")
+        resp = self._api_get(f"{API_BASE}/repos/{self.repo}/commits/{sha}")
         if resp.status_code == 404:
             log.warning("Commit %s not found (404)", sha)
             return None
@@ -333,6 +336,35 @@ class GitHubExporter:
         }
 
     # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _api_get(self, url: str, **kwargs) -> requests.Response:
+        """GET with rate-limit 403 retry.  Waits and retries once on rate
+        limit exhaustion instead of crashing."""
+        resp = self.session.get(url, **kwargs)
+        if resp.status_code == 403:
+            if self._is_rate_limited(resp):
+                wait = self._rate_limit_wait(resp)
+                log.warning("Rate limit exceeded, waiting %ds before retry", wait)
+                time.sleep(wait)
+                self._refresh_token_if_needed()
+                resp = self.session.get(url, **kwargs)
+        return resp
+
+    @staticmethod
+    def _is_rate_limited(resp) -> bool:
+        try:
+            return "rate limit" in resp.json().get("message", "").lower()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _rate_limit_wait(resp) -> int:
+        """Compute seconds to wait from X-RateLimit-Reset header."""
+        reset = resp.headers.get("X-RateLimit-Reset")
+        if reset:
+            wait = int(reset) - int(time.time()) + 5  # 5s buffer
+            return max(wait, 60)
+        return 300  # default 5 minutes if no header
 
     @staticmethod
     def _log_403(resp, context: str) -> None:
@@ -388,7 +420,7 @@ class GitHubExporter:
         numbers = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/pulls",
                 params={
                     "state": self.pr_state,
@@ -410,7 +442,7 @@ class GitHubExporter:
         return numbers
 
     def _fetch_pr_detail(self, number: int) -> dict | None:
-        resp = self.session.get(f"{API_BASE}/repos/{self.repo}/pulls/{number}")
+        resp = self._api_get(f"{API_BASE}/repos/{self.repo}/pulls/{number}")
         if resp.status_code == 404:
             log.warning("PR #%d not found (404)", number)
             return None
@@ -458,7 +490,7 @@ class GitHubExporter:
         items = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/pulls/{number}/reviews",
                 params={"per_page": 100, "page": page},
             )
@@ -481,7 +513,7 @@ class GitHubExporter:
         items = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/pulls/{number}/comments",
                 params={"per_page": 100, "page": page},
             )
@@ -505,7 +537,7 @@ class GitHubExporter:
         items = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/issues/{number}/comments",
                 params={"per_page": 100, "page": page},
             )
@@ -527,7 +559,7 @@ class GitHubExporter:
         items = []
         page = 1
         while True:
-            resp = self.session.get(
+            resp = self._api_get(
                 f"{API_BASE}/repos/{self.repo}/pulls/{number}/commits",
                 params={"per_page": 100, "page": page},
             )
