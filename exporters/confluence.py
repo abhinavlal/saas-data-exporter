@@ -325,7 +325,7 @@ class ConfluenceExporter:
                 continue
 
             s3_path = f"{s3_base}/attachments/{page_id}/{filename}"
-            full_url = f"https://{self.domain}{download_url}"
+            full_url = f"https://{self.domain}/wiki{download_url}"
 
             try:
                 self._download_attachment(full_url, s3_path, filename)
