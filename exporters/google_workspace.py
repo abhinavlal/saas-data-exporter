@@ -7,10 +7,13 @@ import io
 import logging
 import os
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+import google_auth_httplib2
+import httplib2
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -135,6 +138,7 @@ class GoogleWorkspaceExporter:
         total_processed = len(index_entries)  # account for already-exported on resume
         last_logged = total_processed
         page_token = self.checkpoint.get_cursor("gmail_page")
+        had_error = False
 
         while True:
             batch_size = 100
@@ -144,12 +148,17 @@ class GoogleWorkspaceExporter:
                     break
                 batch_size = min(100, remaining)
 
-            resp = service.users().messages().list(
-                userId="me",
-                maxResults=batch_size,
-                pageToken=page_token,
-                quotaUser=self.user,
-            ).execute()
+            try:
+                resp = service.users().messages().list(
+                    userId="me",
+                    maxResults=batch_size,
+                    pageToken=page_token,
+                    quotaUser=self.user,
+                ).execute()
+            except HttpError as e:
+                log.error("Gmail list error for %s: %s", self.user, e)
+                had_error = True
+                break
 
             page_msgs = resp.get("messages", [])
             msg_ids = [m["id"] for m in page_msgs
@@ -199,7 +208,10 @@ class GoogleWorkspaceExporter:
         # Upload index
         self.s3.upload_json(index_entries, f"{self.s3_base}/gmail/_index.json")
         self.stats.save(force=True)
-        self.checkpoint.complete_phase("gmail")
+        if had_error:
+            log.warning("Gmail export incomplete for %s due to errors — will retry on next run", self.user)
+        else:
+            self.checkpoint.complete_phase("gmail")
         self.checkpoint.save(force=True)
         log.info("Exported %d Gmail messages for %s", total_processed, self.user)
 
@@ -217,15 +229,24 @@ class GoogleWorkspaceExporter:
             self.stats.add_to_map("gmail.attachments_by_extension", ext)
 
     def _parallel_fetch_raw(self, service, msg_ids: list[str]) -> dict[str, dict]:
-        """Fetch raw messages with 10 concurrent API calls and per-message retry."""
+        """Fetch raw messages with 10 concurrent API calls and per-message retry.
+
+        Each thread gets its own httplib2.Http via thread-local storage because
+        the default Http inside ``service`` is NOT thread-safe.
+        """
         results = {}
+        local = threading.local()
 
         @retry(max_attempts=5, backoff_base=2.0, exceptions=(HttpError,))
         def _fetch_one(msg_id):
+            if not hasattr(local, "http"):
+                local.http = google_auth_httplib2.AuthorizedHttp(
+                    self.credentials, http=httplib2.Http(),
+                )
             msg = service.users().messages().get(
                 userId="me", id=msg_id, format="raw",
                 quotaUser=self.user,
-            ).execute()
+            ).execute(http=local.http)
             return msg_id, msg
 
         with ThreadPoolExecutor(max_workers=10) as pool:

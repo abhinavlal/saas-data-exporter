@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 import boto3
 import pytest
+from googleapiclient.errors import HttpError
 from moto import mock_aws
 
 from lib.s3 import S3Store
@@ -421,3 +422,173 @@ class TestFullExport:
         assert stats["target"] == USER
         assert stats["gmail"]["total_messages"] == 1
         assert stats["calendar"]["total_events"] == 1
+
+
+# ── Gmail Error Handling Tests ───────────────────────────────────────────
+
+class TestGmailListError:
+    """Smoke tests for HttpError on messages().list() — Bug fix regression guard."""
+
+    def test_list_error_does_not_complete_phase(self, s3_env, mock_credentials):
+        """HttpError on messages().list() must leave the phase incomplete for retry."""
+        store, config, _ = s3_env
+        service = MagicMock()
+        resp = MagicMock(status=429)
+        service.users().messages().list().execute.side_effect = HttpError(resp, b"rate limit")
+
+        with patch("exporters.google_workspace.build", return_value=service):
+            from exporters.google_workspace import GoogleWorkspaceExporter
+            exporter = GoogleWorkspaceExporter(
+                user=USER, service_account_key="fake.json",
+                s3=store, config=config,
+                email_limit=10, skip_calendar=True, skip_drive=True,
+            )
+            exporter.run()
+
+        # Phase NOT completed — next run should retry
+        from lib.checkpoint import CheckpointManager
+        cp = CheckpointManager(store, f"google/{USER_SLUG}")
+        cp.load()
+        assert not cp.is_phase_done("gmail")
+
+        # Index still uploaded (empty is fine)
+        index = store.download_json(f"google/{USER_SLUG}/gmail/_index.json")
+        assert index == []
+
+    def test_list_error_still_exports_calendar(self, s3_env, mock_credentials):
+        """Gmail list failure must not prevent calendar/drive from running."""
+        store, config, _ = s3_env
+
+        # Gmail — fails on list
+        gmail_service = MagicMock()
+        resp = MagicMock(status=429)
+        gmail_service.users().messages().list().execute.side_effect = HttpError(resp, b"rate limit")
+
+        # Calendar — works
+        cal_service = _mock_calendar_service([
+            {"id": "e1", "summary": "Mtg", "start": {"dateTime": "2024-06-01T09:00:00Z"}, "status": "confirmed"},
+        ])
+
+        # Drive — empty
+        drive_service = _mock_drive_service([])
+
+        def build_side_effect(api, version, **kwargs):
+            if api == "gmail":
+                return gmail_service
+            elif api == "calendar":
+                return cal_service
+            elif api == "drive":
+                return drive_service
+
+        with patch("exporters.google_workspace.build", side_effect=build_side_effect):
+            from exporters.google_workspace import GoogleWorkspaceExporter
+            exporter = GoogleWorkspaceExporter(
+                user=USER, service_account_key="fake.json",
+                s3=store, config=config,
+                email_limit=10, event_limit=10, file_limit=10,
+            )
+            exporter.run()
+
+        # Gmail phase incomplete
+        from lib.checkpoint import CheckpointManager
+        cp = CheckpointManager(store, f"google/{USER_SLUG}")
+        cp.load()
+        assert not cp.is_phase_done("gmail")
+
+        # Calendar phase DID complete
+        assert cp.is_phase_done("calendar")
+        assert store.exists(f"google/{USER_SLUG}/calendar/events/e1.json")
+
+    def test_partial_progress_saved_on_second_page_error(self, s3_env, mock_credentials):
+        """First page succeeds, second page fails → first page messages are saved."""
+        store, config, _ = s3_env
+
+        raw_email = _make_raw_email()
+        msg_data = {
+            "id": "msg1", "threadId": "t1", "labelIds": ["INBOX"],
+            "snippet": "First page", "internalDate": "1700000000000",
+            "sizeEstimate": 100, "raw": raw_email,
+        }
+
+        # Build a service where list() returns page 1 with nextPageToken,
+        # then raises on page 2.
+        service = MagicMock()
+        page1_resp = {
+            "messages": [{"id": "msg1"}],
+            "nextPageToken": "page2_token",
+        }
+        error_resp = MagicMock(status=500)
+        service.users().messages().list().execute.side_effect = [
+            page1_resp,
+            HttpError(error_resp, b"server error"),
+        ]
+
+        # messages().get() returns msg_data
+        def get_side_effect(*args, **kwargs):
+            mock_req = MagicMock()
+            mock_req.execute.return_value = msg_data
+            return mock_req
+        service.users().messages().get.side_effect = get_side_effect
+
+        with patch("exporters.google_workspace.build", return_value=service):
+            from exporters.google_workspace import GoogleWorkspaceExporter
+            exporter = GoogleWorkspaceExporter(
+                user=USER, service_account_key="fake.json",
+                s3=store, config=config,
+                email_limit=100, skip_calendar=True, skip_drive=True,
+            )
+            exporter.run()
+
+        # First page message WAS saved
+        assert store.exists(f"google/{USER_SLUG}/gmail/msg1.eml")
+        index = store.download_json(f"google/{USER_SLUG}/gmail/_index.json")
+        assert len(index) == 1
+        assert index[0]["id"] == "msg1"
+
+        # Phase NOT completed — will retry
+        from lib.checkpoint import CheckpointManager
+        cp = CheckpointManager(store, f"google/{USER_SLUG}")
+        cp.load()
+        assert not cp.is_phase_done("gmail")
+
+
+# ── Thread-Safety Tests ──────────────────────────────────────────────────
+
+class TestParallelFetchThreadSafety:
+    """Smoke tests for _parallel_fetch_raw using per-thread HTTP objects."""
+
+    def test_parallel_fetch_creates_authorized_http(self, s3_env, mock_credentials):
+        """Each worker thread must get its own AuthorizedHttp (not share the service's)."""
+        store, config, _ = s3_env
+
+        raw_email = _make_raw_email()
+        # 5 messages — enough to hit multiple threads
+        ids = [f"m{i}" for i in range(5)]
+        raw_msgs = {
+            mid: {
+                "id": mid, "threadId": "t1", "labelIds": [],
+                "snippet": "", "internalDate": "1700000000000",
+                "sizeEstimate": 100, "raw": raw_email,
+            }
+            for mid in ids
+        }
+        gmail_service = _mock_gmail_service(ids, raw_msgs)
+
+        with patch("exporters.google_workspace.build", return_value=gmail_service), \
+             patch("exporters.google_workspace.google_auth_httplib2.AuthorizedHttp") as mock_auth:
+            mock_auth.return_value = MagicMock()
+
+            from exporters.google_workspace import GoogleWorkspaceExporter
+            exporter = GoogleWorkspaceExporter(
+                user=USER, service_account_key="fake.json",
+                s3=store, config=config,
+                email_limit=10, skip_calendar=True, skip_drive=True,
+            )
+            exporter.run()
+
+        # AuthorizedHttp was created (at least once, up to thread count)
+        assert mock_auth.call_count >= 1
+        # Each call should receive an httplib2.Http instance
+        for call in mock_auth.call_args_list:
+            _, kwargs = call
+            assert "http" in kwargs
