@@ -1,234 +1,243 @@
 # Data Exporter
 
-Production-grade data exporter for GitHub, Google Workspace, Jira, Slack, and Confluence. Exports structured JSON/CSV data to S3 with checkpointing, rate limiting, and parallel I/O.
+Batch data exporter for GitHub, Google Workspace, Jira, Slack, and Confluence. Exports structured JSON data to S3 with per-item files, checkpointing, rate limiting, and parallel execution.
+
+## Quick Start
+
+```bash
+uv sync                  # install dependencies
+cp .env.example .env     # configure credentials + targets
+uv run python -m exporters.github              # export GitHub repos
+uv run python -m exporters.jira                # export Jira projects
+uv run python -m exporters.slack               # export Slack channels
+uv run python -m exporters.google_workspace    # export Google Workspace users
+uv run python -m exporters.confluence          # export Confluence spaces
+```
+
+Check export progress:
+
+```bash
+uv run python -m scripts.export_status
+```
 
 ## Installation
 
 ```bash
-uv sync              # install dependencies
-uv sync --extra dev  # install dev dependencies (pytest, moto)
-uv sync --extra fast # install boto3[crt] for 2-6x S3 throughput
+uv sync              # core dependencies
+uv sync --extra dev  # adds pytest, moto, responses
+uv sync --extra fast # adds boto3[crt] for 2-6x S3 throughput
 ```
 
 Requires Python 3.12+.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your values:
+Copy `.env.example` to `.env` and fill in your values. All exporters read from `.env` automatically. CLI arguments override env vars.
 
-```bash
-cp .env.example .env
-```
+**Priority:** CLI args > environment variables > `.env` file > defaults
 
-All exporters read from `.env` automatically. CLI arguments override env vars. The priority is:
-
-**CLI args > environment variables > `.env` file > defaults**
-
-AWS credentials use standard AWS environment variables (or IAM roles):
-
-```bash
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_DEFAULT_REGION=us-east-1
-```
-
-With `.env` configured, running an exporter is just:
-
-```bash
-uv run python -m exporters.github            # uses GITHUB_TOKEN, GITHUB_REPOS from .env
-uv run python -m exporters.jira              # uses JIRA_TOKEN, JIRA_EMAIL, JIRA_PROJECTS from .env
-uv run python -m exporters.slack             # uses SLACK_TOKEN, SLACK_CHANNEL_IDS from .env
-uv run python -m exporters.google_workspace  # uses GOOGLE_SERVICE_ACCOUNT_KEY, GOOGLE_USERS from .env
-uv run python -m exporters.confluence        # uses JIRA_TOKEN, JIRA_EMAIL, CONFLUENCE_SPACES from .env
-```
-
-Any setting can still be overridden on the CLI:
-
-```bash
-uv run python -m exporters.github --repo other/repo --commit-limit 100
-```
-
-## Usage (full CLI reference)
+## Exporters
 
 ### GitHub
 
+Exports repo metadata, contributors, commits, and pull requests (with reviews, comments, sub-resources).
+
 ```bash
-uv run python -m exporters.github \
-  --token ghp_YOUR_TOKEN \
-  --repo owner/repo-name \
-  --s3-bucket my-export-bucket \
-  --s3-prefix exports
+uv run python -m exporters.github
 ```
+
+**Authentication options:**
+
+| Method | Rate Limit | Config |
+|--------|-----------|--------|
+| **PAT** (simple) | 5,000 req/hr per token | `GITHUB_TOKEN=ghp_TOKEN1,ghp_TOKEN2` |
+| **GitHub App** (recommended) | 5,000-12,500 req/hr per app | See [GitHub App Setup](docs/github-app-setup.md) |
+
+Multiple PATs or Apps are round-robined across repos for independent rate limit pools.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--token` | required | GitHub personal access token |
-| `--repo` | required | Repository in `owner/repo` format |
-| `--s3-bucket` | required | S3 bucket name |
-| `--s3-prefix` | `""` | S3 key prefix |
-| `--pr-limit` | 500 | Max pull requests to fetch |
-| `--pr-state` | `all` | PR state filter: `open`, `closed`, `all` |
-| `--commit-limit` | 1000 | Max commits to fetch |
-| `--skip-commits` | false | Skip commit export |
-| `--skip-prs` | false | Skip PR export |
-| `--max-workers` | 5 | Parallel threads for API calls |
+| `--token` | `GITHUB_TOKEN` | PAT(s), comma-separated for round-robin |
+| `--app-id` | `GITHUB_APP_ID` | GitHub App ID(s), comma-separated |
+| `--app-key` | `GITHUB_APP_PRIVATE_KEY` | Path to .pem key(s), comma-separated |
+| `--app-installation-id` | `GITHUB_APP_INSTALLATION_ID` | Installation ID(s), comma-separated |
+| `--repo` | | Repository(s) in `owner/repo` format |
+| `--input-csv` | `GITHUB_INPUT_CSV` | CSV file with `repo` column |
+| `--pr-limit` | `0` (all) | Max PRs per repo |
+| `--pr-state` | `all` | `open`, `closed`, or `all` |
+| `--include-commits` | `false` | Include commit export (off by default) |
+| `--commit-limit` | `0` (all) | Max commits per repo |
+| `--commit-details` | `false` | Fetch full commit details (stats, files, patches) |
+| `--parallel` | `4` | Repos to export simultaneously |
+| `--max-workers` | `10` | Parallel PR/commit detail fetches per repo |
 
 ### Jira
 
+Exports tickets (with comments, changelogs, custom fields) and attachments.
+
 ```bash
-uv run python -m exporters.jira \
-  --token YOUR_API_TOKEN \
-  --email you@company.com \
-  --project IES \
-  --s3-bucket my-export-bucket
+uv run python -m exporters.jira
 ```
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--token` | required | Jira API token |
-| `--email` | required | Jira account email |
-| `--domain` | `org_name.atlassian.net` | Jira domain |
-| `--project` | required | Project key(s), repeatable |
-| `--s3-bucket` | required | S3 bucket name |
-| `--limit` | 100 | Max tickets per project |
-| `--skip-attachments` | false | Skip downloading attachments |
-| `--skip-comments` | false | Skip fetching comments |
+| `--token` | `JIRA_TOKEN` | Jira API token |
+| `--email` | `JIRA_EMAIL` | Jira account email |
+| `--domain` | `org_name.atlassian.net` | Jira Cloud domain |
+| `--project` | `JIRA_PROJECTS` | Project key(s), repeatable |
+| `--input-csv` | `JIRA_INPUT_CSV` | CSV file with `project` column |
+| `--limit` | `0` (all) | Max tickets per project |
+| `--skip-attachments` | `false` | Skip downloading attachments |
+| `--skip-comments` | `false` | Skip fetching comments |
+| `--parallel` | `3` | Projects to export simultaneously |
+| `--max-workers` | `10` | Parallel attachment downloads |
+
+Rate limit: 20 req/s (Jira Cloud Standard with 250 users allows ~28 sustained, 100 burst). All projects share one tenant rate limit — multiple tokens don't help.
 
 ### Slack
 
+Exports channel info, messages (with thread replies embedded), and file attachments.
+
 ```bash
-uv run python -m exporters.slack \
-  --token xoxb-YOUR-BOT-TOKEN \
-  --channel-ids C090J5ZPP51 C0ABC123456 \
-  --s3-bucket my-export-bucket \
-  --include-threads
+uv run python -m exporters.slack
 ```
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--token` | required | Slack Bot Token (`xoxb-...`) |
-| `--channel-ids` | | Channel IDs (space-separated) |
-| `--input-csv` | `channels.csv` | CSV with `channel_id` column |
-| `--s3-bucket` | required | S3 bucket name |
-| `--include-threads` | false | Include thread replies |
-| `--skip-attachments` | false | Skip file downloads |
-| `--list-channels` | false | List accessible channels and exit |
+| `--token` | `SLACK_TOKEN` | Slack Bot Token (`xoxb-...`) |
+| `--channel-ids` | | Channel IDs, space-separated |
+| `--input-csv` | `SLACK_INPUT_CSV` | CSV with `channel_id` column |
+| `--include-threads` | `false` | Fetch and embed thread replies in parent messages |
+| `--skip-attachments` | `false` | Skip file downloads |
+| `--list-channels` | | List accessible channels and exit |
+| `--parallel` | `1` | Channels to export simultaneously |
+| `--max-workers` | `10` | Parallel attachment downloads per channel |
+
+Rate limit: 0.8 req/s (Slack Tier 3 ~50/min). All channels share one bot token. Attachment downloads use CDN URLs and are not rate-limited.
 
 ### Google Workspace
 
+Exports Gmail (raw .eml + attachments), Calendar events, and Drive files per user.
+
 ```bash
-uv run python -m exporters.google_workspace \
-  --user someone@company.com \
-  --key service-account.json \
-  --s3-bucket my-export-bucket
+uv run python -m exporters.google_workspace
 ```
+
+Requires a Google service account with domain-wide delegation. See [Google Service Account Setup](docs/google-service-account-setup.md).
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--user` | required | Target user email |
-| `--key` | required | Service account JSON key file |
-| `--s3-bucket` | required | S3 bucket name |
-| `--emails` | 500 | Number of emails to export |
-| `--events` | 500 | Number of calendar events |
-| `--files` | 50 | Number of Drive files |
-| `--skip-gmail` | false | Skip Gmail export |
-| `--skip-calendar` | false | Skip Calendar export |
-| `--skip-drive` | false | Skip Drive export |
+| `--user` | | Target user email(s) |
+| `--input-csv` | `GOOGLE_INPUT_CSV` | CSV with `user` column |
+| `--key` | `GOOGLE_SERVICE_ACCOUNT_KEY` | Service account JSON key file |
+| `--emails` | `0` (all) | Max emails per user |
+| `--events` | `0` (all) | Max calendar events per user |
+| `--files` | `0` (all) | Max Drive files per user |
+| `--skip-gmail` | `false` | Skip Gmail export |
+| `--skip-calendar` | `false` | Skip Calendar export |
+| `--skip-drive` | `false` | Skip Drive export |
+| `--parallel` | `50` | Users to export simultaneously |
+| `--max-workers` | `5` | Parallel uploads per user |
+
+Each user gets independent API quota via `quotaUser` parameter. 50 parallel users validated with zero rate limit errors across 519 users.
 
 ### Confluence
 
+Exports pages (with comments), and attachments per space.
+
 ```bash
-uv run python -m exporters.confluence \
-  --space ENG \
-  --s3-bucket my-export-bucket
+uv run python -m exporters.confluence
 ```
 
-Uses the same Atlassian credentials as Jira (falls back to `JIRA_TOKEN`/`JIRA_EMAIL`/`JIRA_DOMAIN`). By default, exports all pages in each space with comments and attachments.
+Uses the same Atlassian credentials as Jira by default.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--space` | required | Space key(s), repeatable |
-| `--input-csv` | | CSV file with `space` column |
-| `--s3-bucket` | required | S3 bucket name |
-| `--s3-prefix` | `""` | S3 key prefix |
+| `--space` | `CONFLUENCE_SPACES` | Space key(s), repeatable |
+| `--input-csv` | `CONFLUENCE_INPUT_CSV` | CSV with `space` column |
 | `--page-limit` | `0` (all) | Max pages per space |
-| `--skip-comments` | `false` | Skip fetching page comments |
+| `--skip-comments` | `false` | Skip page comments |
 | `--skip-attachments` | `false` | Skip downloading attachments |
-| `--body-format` | `storage` | Page body format: `storage` (XHTML) or `atlas_doc_format` (ADF JSON) |
-| `--parallel` | `1` | Spaces to export in parallel |
-
-Each page is fully processed (content + comments + attachments) before moving to the next, with per-page checkpointing. If interrupted, restarts resume from the saved pagination cursor.
+| `--body-format` | `storage` | `storage` (XHTML) or `atlas_doc_format` (ADF JSON) |
+| `--parallel` | `1` | Spaces to export simultaneously |
 
 ## S3 Output Structure
+
+Every item is its own JSON file. No combined arrays.
 
 ```
 s3://{bucket}/{prefix}/
   github/{owner}__{repo}/
-    repo_metadata.json              # repo info, language breakdown
-    contributors.json               # sorted by contributions
-    commits/{sha}.json              # one file per commit
-    prs/{number}.json               # one file per PR (with reviews, comments, commits)
-    pull_requests.csv               # flat CSV summary of all PRs
-    _stats.json                     # aggregate export stats
+    repo_metadata.json
+    contributors.json
+    commits/{sha}.json
+    prs/{number}.json               # includes reviews, comments, commits
+    _stats.json
   jira/{project}/
-    tickets/{key}.json              # one file per ticket (with comments, changelog)
-    tickets/_index.json             # {keys: [...], custom_fields: [...]}
-    tickets.csv                     # flat CSV summary
-    attachments/{key}/{filename}    # binary attachments
+    tickets/{key}.json              # includes comments, changelog, custom fields
+    tickets/_index.json
+    attachments/{key}/{filename}
     _stats.json
   slack/{channel_id}/
-    channel_info.json               # channel metadata
-    messages/{ts}.json              # one file per message (with thread replies)
-    messages/_index.json            # array of message timestamps
-    attachments/{file_id}_{name}    # binary files
+    channel_info.json
+    messages/{ts}.json              # thread replies embedded as _replies array
+    messages/_index.json
+    attachments/{file_id}_{name}
     _stats.json
-  google/{user_at_domain}/
-    gmail/{message_id}.eml          # raw email
-    gmail/_index.json               # lightweight index with labels, size, attachments
-    gmail/attachments/{id}/{file}   # email attachments
-    calendar/events/{event_id}.json # one file per event
-    calendar/_index.json            # array of event IDs
-    drive/{filename}                # Drive files (Google Docs exported as .docx/.xlsx/.pptx)
-    drive/_index.json               # file metadata + download status
+  google/{user_slug}/
+    gmail/{message_id}.eml
+    gmail/_index.json
+    gmail/attachments/{id}/{file}
+    calendar/events/{event_id}.json
+    calendar/_index.json
+    drive/{file_id}_{filename}
+    drive/_index.json
     _stats.json
   confluence/{space_key}/
-    pages/{page_id}.json            # page content + comments (single pass)
-    pages/_index.json               # array of page IDs
-    attachments/{page_id}/{file}    # page attachments
+    pages/{page_id}.json
+    pages/_index.json
+    attachments/{page_id}/{file}
     _stats.json
-  _checkpoints/
-    github/{owner}__{repo}.json
-    jira/{project}.json
-    slack/{channel_id}.json
-    google/{user_at_domain}.json
-    confluence/{space_key}.json
+  _checkpoints/{exporter}/{target}.json
 ```
 
 ## Checkpoint / Resume
 
-Each exporter saves progress to `_checkpoints/` in S3. If an export is interrupted (crash, timeout, Ctrl+C), restart with the same arguments and it will resume from the last checkpoint:
+Exports are resumable. If interrupted, restart with the same arguments:
 
 - Completed phases are skipped entirely
-- Within a phase, individual items (commits, tickets, messages) that were already processed are skipped
-- Checkpoints are saved every 30 seconds (configurable) and on phase completion
+- Within a phase, completed items are skipped (tracked by ID in checkpoint)
+- Checkpoints saved every 30 seconds and on phase completion
+- Index files (`_index.json`) preserve pre-crash items on resume
 
 To re-export from scratch, delete the checkpoint file in S3.
 
+## Export Status
+
+```bash
+uv run python -m scripts.export_status                    # all exports
+uv run python -m scripts.export_status --s3-prefix v31    # specific prefix
+```
+
 ## Rate Limiting
 
-All exporters use a shared token-bucket rate limiter that:
+All HTTP-based exporters use a shared token-bucket rate limiter that:
 
-- Acquires a token before each API request (configurable requests/second)
-- Reads `X-RateLimit-Remaining` headers and preemptively waits when quota is low
-- Retries on HTTP 429 with `Retry-After` header or exponential backoff
+- Acquires a token before each API request
+- Reads `X-RateLimit-Remaining` headers and preemptively slows down (capped at 30s max wait)
+- Retries on HTTP 429 with `Retry-After` or exponential backoff
 - Retries on HTTP 500/502/503 with exponential backoff
+- Handles 403 rate limits (GitHub abuse detection) with wait-and-retry
 
 ## Running Tests
 
 ```bash
 uv run pytest tests/ -v         # all tests, verbose
-uv run pytest tests/ -q         # quiet output
+uv run pytest tests/ -q         # quiet
 uv run pytest tests/test_s3.py  # single module
 ```
 
-Tests use [moto](https://github.com/getmoto/moto) for S3 mocking and [responses](https://github.com/getsentry/responses) for HTTP mocking.
+## Docs
+
+- [GitHub App Setup](docs/github-app-setup.md) — Creating a GitHub App for higher rate limits
+- [Google Service Account Setup](docs/google-service-account-setup.md) — Domain-wide delegation for Workspace export
