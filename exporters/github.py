@@ -50,7 +50,9 @@ class GitHubExporter:
         self.session, self.rate_state = make_session(
             requests_per_second=10,
             burst=20,
-            min_remaining=50,
+            # Pool mode: disable session-level preemptive wait (-1) — the pool
+            # manages rate limits across multiple apps with different budgets.
+            min_remaining=-1 if app_pool else 50,
         )
         if app_pool:
             # Token set per-request in _api_get()
