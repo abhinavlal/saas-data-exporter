@@ -121,6 +121,18 @@ INFO  Google Workspace export complete for one-user@company.com
 
 The exporter was validated with 519 users at `--parallel 50` with zero rate limit errors.
 
+## Performance
+
+Gmail fetches in batches of 50 messages. Each `messages.get` costs 5 quota units, so at 15,000 units/min per user, throughput is ~50 messages/second/user. Estimated times for a single user:
+
+| Mailbox size | Estimated time |
+|-------------|---------------|
+| 1,000 emails | ~1 minute |
+| 10,000 emails | ~5 minutes |
+| 50,000 emails | ~17 minutes |
+
+With `--parallel 50`, 50 users export simultaneously. 500 users with 10K emails each takes ~50 minutes total (10 waves of 50).
+
 ## Troubleshooting
 
 **`403: Not Authorized to access this resource/api`**
@@ -131,6 +143,3 @@ The exporter was validated with 519 users at `--parallel 50` with zero rate limi
 
 **`exportSizeLimitExceeded` on Drive files**
 - Google Sheets/Docs larger than 10MB can't be exported via API. The exporter logs a warning and skips the file.
-
-**Slow Gmail export**
-- Gmail fetches in batches of 10 with a 2s sleep between batches. A user with 50K emails takes ~2.7 hours. Increase `--parallel` to process more users simultaneously.
