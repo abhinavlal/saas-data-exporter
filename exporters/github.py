@@ -45,30 +45,22 @@ class GitHubExporter:
         self.skip_prs = skip_prs
         self.commit_details = commit_details
         self._app_pool = app_pool
-        self._pat_token = token
 
         self.session, self.rate_state = make_session(
             requests_per_second=10,
             burst=20,
-            # Pool mode: disable session-level preemptive wait (-1) — the pool
+            # Pool mode: disable session-level preemptive wait — the pool
             # manages rate limits across multiple apps with different budgets.
             min_remaining=-1 if app_pool else 50,
         )
-        if app_pool:
-            # Token set per-request in _api_get()
-            pass
-        else:
-            self.session.headers["Authorization"] = f"Bearer {token}"
         self.session.headers["Accept"] = "application/vnd.github+json"
+        if not app_pool:
+            self.session.headers["Authorization"] = f"Bearer {token}"
 
         self.repo_slug = repo.replace("/", "__")
         self.s3_base = f"github/{self.repo_slug}"
         self.checkpoint = CheckpointManager(s3, f"github/{self.repo_slug}")
         self.stats = StatsCollector(s3, f"{self.s3_base}/_stats.json")
-
-    def _refresh_token_if_needed(self) -> None:
-        """No-op for pool mode (token set per-request). For PAT mode, nothing to refresh."""
-        pass
 
     def run(self):
         self.checkpoint.load()
@@ -79,19 +71,15 @@ class GitHubExporter:
         log.info("Starting GitHub export for %s", self.repo)
 
         if not self.checkpoint.is_phase_done("metadata"):
-            self._refresh_token_if_needed()
             self._export_metadata()
 
         if not self.checkpoint.is_phase_done("contributors"):
-            self._refresh_token_if_needed()
             self._export_contributors()
 
         if not self.skip_commits and not self.checkpoint.is_phase_done("commits"):
-            self._refresh_token_if_needed()
             self._export_commits()
 
         if not self.skip_prs and not self.checkpoint.is_phase_done("pull_requests"):
-            self._refresh_token_if_needed()
             self._export_pull_requests()
 
         self.checkpoint.complete()
@@ -297,7 +285,7 @@ class GitHubExporter:
             log.warning("Commit %s not found (404)", sha)
             return None
         if resp.status_code == 403:
-            self._log_403(resp, f"Commit {sha}")
+            log.warning("Commit %s forbidden (403) — no access", sha)
             return None
         resp.raise_for_status()
         c = resp.json()
@@ -341,46 +329,50 @@ class GitHubExporter:
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _api_get(self, url: str, **kwargs) -> requests.Response:
-        """GET with per-request token selection and rate-limit 403 retry.
+        """Thread-safe GET with per-request token selection and rate-limit retry.
 
-        In pool mode: picks the app with the most remaining budget before
-        each request, and feeds rate limit headers back to the pool.
-        On rate limit 403: switches to next best app and retries immediately.
+        In pool mode: injects the best app's token via per-request header
+        override (never mutates session headers).  On rate limit 403, rotates
+        through remaining apps before falling back to a timed wait.
+
+        In PAT mode: uses the session-level Authorization header set in __init__.
+        On rate limit 403, waits for reset and retries once.
         """
+        max_attempts = (len(self._app_pool) + 1) if self._app_pool else 2
+
+        for attempt in range(max_attempts):
+            token = self._pick_token()
+            auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
+            resp = self.session.get(url, headers=auth_headers, **kwargs)
+            self._feed_back_rate_limit(token, resp)
+
+            if resp.status_code != 403 or not self._is_rate_limited(resp):
+                return resp
+
+            log.warning("Rate limited (attempt %d/%d), trying next token",
+                        attempt + 1, max_attempts)
+
+        # All tokens exhausted — wait for soonest reset and retry once
+        wait = self._rate_limit_wait(resp)
+        log.warning("All tokens exhausted, waiting %ds for reset", wait)
+        time.sleep(wait)
+
         token = self._pick_token()
-        self.session.headers["Authorization"] = f"Bearer {token}"
-        resp = self.session.get(url, **kwargs)
+        auth_headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = self.session.get(url, headers=auth_headers, **kwargs)
         self._feed_back_rate_limit(token, resp)
-
-        if resp.status_code == 403 and self._is_rate_limited(resp):
-            if self._app_pool:
-                # Try another app immediately
-                token = self._pick_token()
-                self.session.headers["Authorization"] = f"Bearer {token}"
-                resp = self.session.get(url, **kwargs)
-                self._feed_back_rate_limit(token, resp)
-
-            # If still rate limited (all apps exhausted), wait for reset
-            if resp.status_code == 403 and self._is_rate_limited(resp):
-                wait = self._rate_limit_wait(resp)
-                log.warning("All tokens exhausted, waiting %ds for reset", wait)
-                time.sleep(wait)
-                token = self._pick_token()
-                self.session.headers["Authorization"] = f"Bearer {token}"
-                resp = self.session.get(url, **kwargs)
-                self._feed_back_rate_limit(token, resp)
-
         return resp
 
-    def _pick_token(self) -> str:
-        """Pick the best available token (pool mode) or return PAT."""
+    def _pick_token(self) -> str | None:
+        """Pick the best available token (pool mode) or None (PAT mode)."""
         if self._app_pool:
             return self._app_pool.get_best_token()
-        return self._pat_token
+        return None
 
-    def _feed_back_rate_limit(self, token: str, resp: requests.Response) -> None:
+    def _feed_back_rate_limit(self, token: str | None,
+                              resp: requests.Response) -> None:
         """Update the pool's budget tracking from response headers."""
-        if not self._app_pool:
+        if not self._app_pool or not token:
             return
         remaining = resp.headers.get("X-RateLimit-Remaining")
         reset = resp.headers.get("X-RateLimit-Reset")
@@ -406,18 +398,6 @@ class GitHubExporter:
             wait = int(reset) - int(time.time()) + 5  # 5s buffer
             return max(wait, 60)
         return 300  # default 5 minutes if no header
-
-    @staticmethod
-    def _log_403(resp, context: str) -> None:
-        """Log a 403 with the correct reason — rate limit vs permission."""
-        try:
-            msg = resp.json().get("message", "")
-        except Exception:
-            msg = ""
-        if "rate limit" in msg.lower():
-            log.warning("%s — rate limit exceeded (403), will retry after reset", context)
-        else:
-            log.warning("%s — forbidden (403), token may lack access", context)
 
     # ── Pull Requests ─────────────────────────────────────────────────────
 
@@ -488,7 +468,7 @@ class GitHubExporter:
             log.warning("PR #%d not found (404)", number)
             return None
         if resp.status_code == 403:
-            self._log_403(resp, f"PR #{number}")
+            log.warning("PR #%d forbidden (403) — no access", number)
             return None
         resp.raise_for_status()
         pr = resp.json()
@@ -732,11 +712,6 @@ def main():
     elif not args.token:
         parser.error("--token or GitHub App config (--app-id, --app-key, --app-installation-id) is required")
 
-    # PAT tokens (fallback)
-    tokens = []
-    if args.token:
-        tokens = [t.strip() for t in args.token.split(",") if t.strip()]
-
     log_file = os.path.join(args.log_dir, "github.log")
     setup_logging(level=args.log_level, json_output=not args.no_json_logs, log_file=log_file)
     s3 = S3Store(bucket=args.s3_bucket, prefix=args.s3_prefix)
@@ -749,9 +724,8 @@ def main():
 
     def _export_one_repo(repo: str, index: int) -> None:
         log.info("Exporting repo %s", repo)
-        repo_token = tokens[index % len(tokens)] if tokens and not app_pool else ""
         exporter = GitHubExporter(
-            token=repo_token,
+            token=args.token or "",
             repo=repo,
             s3=s3,
             config=config,
