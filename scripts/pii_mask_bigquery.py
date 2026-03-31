@@ -1,24 +1,21 @@
-"""PII Mask — BigQuery Parquet full PII masking.
+"""PII Mask — BigQuery Parquet masking via DuckDB.
 
 Reads BigQuery GA4 Parquet exports from a source S3 bucket, masks all
 PII (domains, user identifiers, doctor names in URLs, geo locations,
 tracking IDs, sensitive URL paths), and writes masked Parquet files to
 a destination S3 bucket.
 
-Parallelized with ProcessPoolExecutor — each worker independently
-downloads, masks, and uploads one Parquet file.
+Uses DuckDB's httpfs extension to read/write S3 directly — no temp
+files, streaming execution with bounded memory.  All masking logic is
+expressed in SQL using regexp_replace, list_transform, and struct_pack.
 """
 
 import argparse
 import logging
 import os
-import secrets
-import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
+import duckdb
 
 from lib.checkpoint import CheckpointManager
 from lib.logging import setup_logging
@@ -26,23 +23,20 @@ from lib.s3 import S3Store
 
 log = logging.getLogger(__name__)
 
-# Preferred tmp dir (avoid RAM-backed /tmp on some systems)
-_TMP_DIR = next((d for d in ("/var/tmp",) if os.path.isdir(d)), None)
+# -- Constants -------------------------------------------------------------- #
 
-# Default domain mapping
 DEFAULT_SOURCE_DOMAIN = "practo.com"
 DEFAULT_TARGET_DOMAIN = "example-health.com"
+DEFAULT_WORKERS = 4
 
-# -- Regex patterns applied to ALL string values recursively --------------- #
-#
+# Regex patterns applied to all string values.
 # Order matters — more specific patterns first, domain patterns last.
-
 REGEX_PATTERNS = [
-    # URL path: doctor name slugs → redacted
+    # URL path: doctor name slugs
     (r"/doctor/[a-zA-Z0-9_-]+", "/doctor/redacted"),
-    # URL path: consult question slugs → redacted
+    # URL path: consult question slugs
     (r"/consult/[^/?#]+", "/consult/redacted"),
-    # URL path: feedback upload IDs → redacted
+    # URL path: feedback upload IDs
     (r"/feedback/upload/[0-9]+", "/feedback/upload/0"),
     # URL query params: session/practice/tracking IDs
     (r"practice_id=[0-9]+", "practice_id=0"),
@@ -56,280 +50,387 @@ REGEX_PATTERNS = [
 ]
 
 # Event param keys whose string_value should be randomized
-_RANDOMIZE_PARAM_KEYS = frozenset({"gclid", "transaction_id"})
+_RANDOMIZE_PARAM_KEYS = ("gclid", "transaction_id")
 
-# Event param keys whose string_value should be redacted (sensitive text)
-_REDACT_PARAM_KEYS = frozenset({"term"})
+# Event param keys whose string_value should be redacted
+_REDACT_PARAM_KEYS = ("term",)
 
 # Struct fields in collected_traffic_source to randomize
-_TRACKING_ID_FIELDS = frozenset({"gclid", "dclid", "srsltid"})
+_TRACKING_ID_FIELDS = ("gclid", "dclid", "srsltid")
 
 # Geo fields to redact (keep country/continent, redact city-level)
-_GEO_REDACT_FIELDS = frozenset({"city", "region", "metro"})
+_GEO_REDACT_FIELDS = ("city", "region", "metro")
+
+# Device fields to randomize
+_DEVICE_ID_FIELDS = ("vendor_id", "advertising_id")
+
+# Session traffic source campaign ID fields to randomize
+_CAMPAIGN_ID_FIELDS = (
+    "customer_id", "ad_group_id", "campaign_id", "advertiser_id",
+    "creative_id", "insertion_order_id", "line_item_id", "partner_id",
+    "site_id", "rendering_id", "placement_id", "account_id",
+)
 
 
-# -- Helpers ---------------------------------------------------------------- #
+# -- SQL Expression Builders ----------------------------------------------- #
 
-def _random_token(length: int = 32) -> str:
-    return secrets.token_urlsafe(length)
-
-
-def _random_id(length: int = 16) -> str:
-    return secrets.token_hex(length)
-
-
-# -- Column-level regex masking --------------------------------------------- #
-
-def mask_column(col: pa.Array, pattern: str, replacement: str) -> pa.Array:
-    """Replace *pattern* with *replacement* in all string values, recursively.
-
-    Handles flat strings, structs (recursive fields), and lists of
-    structs (e.g. GA4 event_params).  Non-string leaf types are
-    returned unchanged.
-    """
-    if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
-        return pc.replace_substring_regex(col, pattern=pattern,
-                                          replacement=replacement)
-
-    if pa.types.is_struct(col.type):
-        fields = []
-        arrays = []
-        for i in range(col.type.num_fields):
-            field = col.type.field(i)
-            child = col.field(field.name)
-            masked = mask_column(child, pattern, replacement)
-            arrays.append(masked)
-            fields.append(field.with_type(masked.type))
-        return pa.StructArray.from_arrays(
-            arrays,
-            fields=fields,
-            mask=col.is_null(),
-        )
-
-    if pa.types.is_list(col.type) or pa.types.is_large_list(col.type):
-        masked_values = mask_column(col.values, pattern, replacement)
-        return type(col).from_arrays(col.offsets, masked_values)
-
-    # int, float, bool, timestamp, etc. — unchanged
-    return col
-
-
-def _apply_regex_patterns(table: pa.Table, patterns: list[tuple[str, str]],
-                          domain_pattern: str, domain_replacement: str,
-                          ) -> pa.Table:
-    """Apply all regex patterns + domain replacement to every string in table."""
-    all_patterns = patterns + [(domain_pattern, domain_replacement)]
+def _regex_chain_sql(expr: str, domain_re: str,
+                     target_domain: str) -> str:
+    """Wrap *expr* in nested regexp_replace calls for all patterns + domain."""
+    all_patterns = REGEX_PATTERNS + [(domain_re, target_domain)]
+    result = expr
     for pattern, replacement in all_patterns:
-        new_columns = []
-        for i in range(table.num_columns):
-            col = table.column(i)
-            masked = mask_column(col.combine_chunks(), pattern, replacement)
-            new_columns.append(masked)
-        table = pa.table(
-            dict(zip(table.schema.names, new_columns)),
-            schema=table.schema,
-        )
-    return table
+        # Escape single quotes in pattern/replacement for SQL
+        p = pattern.replace("'", "''")
+        r = replacement.replace("'", "''")
+        result = f"regexp_replace({result}, '{p}', '{r}', 'g')"
+    return result
 
 
-# -- Column-specific masking ------------------------------------------------ #
+def _parse_struct_fields(type_str: str) -> list[tuple[str, str]]:
+    """Parse a DuckDB STRUCT(...) type string into (name, type) pairs.
 
-def _randomize_string_column(col: pa.ChunkedArray, generator) -> pa.Array:
-    """Replace all non-null values with random strings from *generator*."""
-    arr = col.combine_chunks()
-    values = [generator() if v.is_valid else None for v in arr]
-    return pa.array(values, type=arr.type)
+    Handles nested structs and lists by tracking parenthesis depth.
+    Field names may be quoted with double quotes.
+    """
+    if not type_str.startswith("STRUCT("):
+        return []
 
-
-def _redact_struct_fields(col: pa.ChunkedArray, field_names: frozenset,
-                          redacted_value: str = "(redacted)") -> pa.Array:
-    """Replace specific string fields within a struct with a fixed value."""
-    arr = col.combine_chunks()
+    inner = type_str[7:-1]  # Strip STRUCT( and )
     fields = []
-    arrays = []
-    for i in range(arr.type.num_fields):
-        field = arr.type.field(i)
-        child = arr.field(field.name)
-        if field.name in field_names and pa.types.is_string(child.type):
-            redacted = pa.array(
-                [redacted_value if v.is_valid else None for v in child],
-                type=child.type,
-            )
-            arrays.append(redacted)
+    depth = 0
+    current = ""
+
+    for ch in inner + ",":  # Trailing comma to flush last field
+        if ch in "([":
+            depth += 1
+            current += ch
+        elif ch in ")]":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            token = current.strip()
+            if token:
+                if token.startswith('"'):
+                    end_quote = token.index('"', 1)
+                    name = token[1:end_quote]
+                    ftype = token[end_quote + 1:].strip()
+                else:
+                    parts = token.split(None, 1)
+                    name = parts[0]
+                    ftype = parts[1] if len(parts) > 1 else ""
+                fields.append((name, ftype))
+            current = ""
         else:
-            arrays.append(child)
-        fields.append(field)
-    return pa.StructArray.from_arrays(arrays, fields=fields, mask=arr.is_null())
+            current += ch
+
+    return fields
 
 
-def _mask_event_params(col: pa.ChunkedArray) -> pa.Array:
-    """Mask PII in event_params: randomize gclid/transaction_id, redact terms."""
-    rows = col.to_pylist()
-    for row in rows:
-        if row is None:
-            continue
-        for param in row:
-            key = param["key"]
-            val = param.get("value")
-            if val is None:
-                continue
-            sv = val.get("string_value")
-            if sv is None:
-                continue
-            if key in _RANDOMIZE_PARAM_KEYS:
-                val["string_value"] = _random_token()
-            elif key in _REDACT_PARAM_KEYS:
-                val["string_value"] = "(redacted)"
-    return pa.array(rows, type=col.type)
+def _col_expr(name: str, dtype: str, domain_re: str,
+              target_domain: str) -> str:
+    """Build the SELECT expression for a single column."""
+
+    # -- Known PII columns with specific handling --------------------------
+
+    if name == "user_pseudo_id":
+        return 'md5(gen_random_uuid()::text) AS "user_pseudo_id"'
+
+    if name == "user_id":
+        return ('CASE WHEN "user_id" IS NOT NULL '
+                'THEN md5(gen_random_uuid()::text) ELSE NULL '
+                'END AS "user_id"')
+
+    if name == "event_params":
+        return _event_params_expr(dtype, domain_re, target_domain)
+
+    if name == "user_properties":
+        # Same structure as event_params
+        return _event_params_expr(
+            dtype, domain_re, target_domain, col_name="user_properties")
+
+    if name == "geo" and "STRUCT" in dtype:
+        return _geo_expr(dtype)
+
+    if name == "device" and "STRUCT" in dtype:
+        return _device_expr(dtype, domain_re, target_domain)
+
+    if name == "collected_traffic_source" and "STRUCT" in dtype:
+        return _tracking_struct_expr(
+            "collected_traffic_source", dtype, _TRACKING_ID_FIELDS,
+            domain_re, target_domain)
+
+    if name == "session_traffic_source_last_click" and "STRUCT" in dtype:
+        return _session_traffic_source_expr(dtype, domain_re, target_domain)
+
+    # -- Generic handling --------------------------------------------------
+
+    if "VARCHAR" in dtype and "STRUCT" not in dtype and "[]" not in dtype:
+        # Top-level string column: apply regex chain
+        chain = _regex_chain_sql(f'"{name}"', domain_re, target_domain)
+        return f'{chain} AS "{name}"'
+
+    if dtype.startswith("STRUCT"):
+        # Unknown struct: apply regex to string fields, pass through others
+        return _generic_struct_expr(name, dtype, domain_re, target_domain)
+
+    # Non-string (int, float, bool, timestamp, etc.) — pass through
+    return f'"{name}"'
 
 
-def _mask_tracking_struct(col: pa.ChunkedArray,
-                          id_fields: frozenset) -> pa.Array:
-    """Randomize tracking ID fields within a struct column."""
-    rows = col.to_pylist()
-    for row in rows:
-        if row is None:
-            continue
-        for field in id_fields:
-            if row.get(field):
-                row[field] = _random_token()
-    return pa.array(rows, type=col.type)
+def _event_params_expr(dtype: str, domain_re: str, target_domain: str,
+                       col_name: str = "event_params") -> str:
+    """Build SQL for event_params: list of struct(key, value struct)."""
+    # Determine value struct fields from the type
+    # dtype looks like: STRUCT("key" VARCHAR, "value" STRUCT(...))[]
+    # Strip [] suffix if present
+    struct_type = dtype.rstrip("[]")
+    outer_fields = _parse_struct_fields(struct_type)
+
+    # Find the value field's struct type
+    value_fields = []
+    for fname, ftype in outer_fields:
+        if fname == "value" and ftype.startswith("STRUCT"):
+            value_fields = _parse_struct_fields(ftype)
+            break
+
+    if not value_fields:
+        # Fallback: standard GA4 value struct
+        value_fields = [
+            ("string_value", "VARCHAR"),
+            ("int_value", "BIGINT"),
+            ("float_value", "DOUBLE"),
+            ("double_value", "DOUBLE"),
+        ]
+
+    # Build value struct_pack for each CASE branch
+    def _value_pack(string_expr: str) -> str:
+        parts = []
+        for vname, vtype in value_fields:
+            if vname == "string_value":
+                parts.append(f'"string_value" := {string_expr}')
+            else:
+                parts.append(f'"{vname}" := ep."value"."{vname}"')
+        return f"struct_pack({', '.join(parts)})"
+
+    randomize_keys = ", ".join(f"'{k}'" for k in _RANDOMIZE_PARAM_KEYS)
+    redact_keys = ", ".join(f"'{k}'" for k in _REDACT_PARAM_KEYS)
+
+    regex_sv = _regex_chain_sql('ep."value"."string_value"',
+                                domain_re, target_domain)
+
+    return f"""list_transform("{col_name}", ep -> struct_pack(
+        "key" := ep."key",
+        "value" := CASE
+            WHEN ep."key" IN ({randomize_keys})
+            THEN {_value_pack("md5(gen_random_uuid()::text)")}
+            WHEN ep."key" IN ({redact_keys})
+            THEN {_value_pack("'(redacted)'")}
+            ELSE {_value_pack(regex_sv)}
+        END
+    )) AS "{col_name}" """
 
 
-def _mask_session_traffic_source(col: pa.ChunkedArray) -> pa.Array:
-    """Randomize tracking IDs nested inside session_traffic_source_last_click."""
-    rows = col.to_pylist()
-    for row in rows:
-        if row is None:
-            continue
-        # Each sub-struct (google_ads_campaign, etc.) may have ID fields
-        for campaign_key, campaign in row.items():
-            if campaign is None or not isinstance(campaign, dict):
-                continue
-            for field in ("customer_id", "ad_group_id", "campaign_id",
-                          "advertiser_id", "creative_id", "insertion_order_id",
-                          "line_item_id", "partner_id", "site_id",
-                          "rendering_id", "placement_id", "account_id"):
-                if campaign.get(field):
-                    campaign[field] = _random_id(8)
-    return pa.array(rows, type=col.type)
+def _geo_expr(dtype: str) -> str:
+    """Redact city/region/metro, keep everything else."""
+    struct_type = dtype.rstrip("[]")
+    fields = _parse_struct_fields(struct_type)
+    if not fields:
+        return '"geo"'
+
+    parts = []
+    for fname, ftype in fields:
+        if fname in _GEO_REDACT_FIELDS:
+            parts.append(
+                f'"{fname}" := CASE WHEN "geo"."{fname}" IS NOT NULL '
+                f"THEN '(redacted)' ELSE NULL END")
+        else:
+            parts.append(f'"{fname}" := "geo"."{fname}"')
+    return f'struct_pack({", ".join(parts)}) AS "geo"'
 
 
-# -- Table-level orchestration ---------------------------------------------- #
+def _device_expr(dtype: str, domain_re: str, target_domain: str) -> str:
+    """Randomize vendor_id/advertising_id, regex on string fields."""
+    struct_type = dtype.rstrip("[]")
+    fields = _parse_struct_fields(struct_type)
+    if not fields:
+        return '"device"'
 
-def mask_table(table: pa.Table, source_domain: str,
-               target_domain: str) -> pa.Table:
-    """Apply full PII masking to a GA4 Arrow table."""
-    n = table.num_rows
-    domain_pattern = source_domain.replace(".", r"\.")
+    parts = []
+    for fname, ftype in fields:
+        if fname in _DEVICE_ID_FIELDS:
+            parts.append(
+                f'"{fname}" := CASE WHEN "device"."{fname}" IS NOT NULL '
+                f"THEN md5(gen_random_uuid()::text) ELSE NULL END")
+        elif "VARCHAR" in ftype and "STRUCT" not in ftype:
+            chain = _regex_chain_sql(f'"device"."{fname}"',
+                                     domain_re, target_domain)
+            parts.append(f'"{fname}" := {chain}')
+        else:
+            parts.append(f'"{fname}" := "device"."{fname}"')
+    return f'struct_pack({", ".join(parts)}) AS "device"'
 
-    # -- Step 1: Column-specific masking (before regex pass) ----------------
 
-    # Randomize user identifiers
-    for col_name, gen in [
-        ("user_id", lambda: _random_id(16)),
-        ("user_pseudo_id", lambda: _random_id(32)),
-    ]:
-        if col_name in table.schema.names:
-            table = table.set_column(
-                table.schema.get_field_index(col_name),
-                col_name,
-                _randomize_string_column(table.column(col_name), gen),
-            )
+def _tracking_struct_expr(col_name: str, dtype: str,
+                          id_fields: tuple, domain_re: str,
+                          target_domain: str) -> str:
+    """Randomize tracking ID fields, regex on string fields."""
+    struct_type = dtype.rstrip("[]")
+    fields = _parse_struct_fields(struct_type)
+    if not fields:
+        return f'"{col_name}"'
 
-    # Redact geo city/region/metro (keep country, continent, sub_continent)
-    if "geo" in table.schema.names:
-        table = table.set_column(
-            table.schema.get_field_index("geo"),
-            "geo",
-            _redact_struct_fields(table.column("geo"), _GEO_REDACT_FIELDS),
-        )
+    parts = []
+    for fname, ftype in fields:
+        ref = f'"{col_name}"."{fname}"'
+        if fname in id_fields:
+            parts.append(
+                f'"{fname}" := CASE WHEN {ref} IS NOT NULL '
+                f"THEN md5(gen_random_uuid()::text) ELSE NULL END")
+        elif "VARCHAR" in ftype and "STRUCT" not in ftype:
+            chain = _regex_chain_sql(ref, domain_re, target_domain)
+            parts.append(f'"{fname}" := {chain}')
+        else:
+            parts.append(f'"{fname}" := {ref}')
+    return f'struct_pack({", ".join(parts)}) AS "{col_name}"'
 
-    # Randomize device identifiers (vendor_id, advertising_id)
-    if "device" in table.schema.names:
-        table = table.set_column(
-            table.schema.get_field_index("device"),
-            "device",
-            _redact_struct_fields(
-                table.column("device"),
-                frozenset({"vendor_id", "advertising_id"}),
-                redacted_value=_random_id(16),
-            ),
-        )
 
-    # Mask event_params (gclid, transaction_id, term)
-    if "event_params" in table.schema.names:
-        table = table.set_column(
-            table.schema.get_field_index("event_params"),
-            "event_params",
-            _mask_event_params(table.column("event_params")),
-        )
+def _session_traffic_source_expr(dtype: str, domain_re: str,
+                                 target_domain: str) -> str:
+    """Randomize campaign IDs nested inside sub-structs."""
+    struct_type = dtype.rstrip("[]")
+    fields = _parse_struct_fields(struct_type)
+    if not fields:
+        return '"session_traffic_source_last_click"'
 
-    # Mask collected_traffic_source tracking IDs
-    if "collected_traffic_source" in table.schema.names:
-        table = table.set_column(
-            table.schema.get_field_index("collected_traffic_source"),
-            "collected_traffic_source",
-            _mask_tracking_struct(
-                table.column("collected_traffic_source"),
-                _TRACKING_ID_FIELDS,
-            ),
-        )
+    col = "session_traffic_source_last_click"
+    parts = []
+    for fname, ftype in fields:
+        ref = f'"{col}"."{fname}"'
+        if ftype.startswith("STRUCT"):
+            # Sub-struct (google_ads_campaign, etc.): randomize ID fields
+            sub_fields = _parse_struct_fields(ftype)
+            if sub_fields:
+                sub_parts = []
+                for sf_name, sf_type in sub_fields:
+                    sf_ref = f'{ref}."{sf_name}"'
+                    if sf_name in _CAMPAIGN_ID_FIELDS:
+                        sub_parts.append(
+                            f'"{sf_name}" := CASE WHEN {sf_ref} IS NOT NULL '
+                            f"THEN md5(gen_random_uuid()::text) ELSE NULL END")
+                    elif "VARCHAR" in sf_type:
+                        chain = _regex_chain_sql(sf_ref,
+                                                 domain_re, target_domain)
+                        sub_parts.append(f'"{sf_name}" := {chain}')
+                    else:
+                        sub_parts.append(f'"{sf_name}" := {sf_ref}')
+                parts.append(
+                    f'"{fname}" := struct_pack({", ".join(sub_parts)})')
+            else:
+                parts.append(f'"{fname}" := {ref}')
+        elif "VARCHAR" in ftype:
+            chain = _regex_chain_sql(ref, domain_re, target_domain)
+            parts.append(f'"{fname}" := {chain}')
+        else:
+            parts.append(f'"{fname}" := {ref}')
+    return f'struct_pack({", ".join(parts)}) AS "{col}"'
 
-    # Mask session_traffic_source_last_click IDs
-    if "session_traffic_source_last_click" in table.schema.names:
-        table = table.set_column(
-            table.schema.get_field_index("session_traffic_source_last_click"),
-            "session_traffic_source_last_click",
-            _mask_session_traffic_source(
-                table.column("session_traffic_source_last_click"),
-            ),
-        )
 
-    # -- Step 2: Regex patterns on ALL strings (domain, URLs, brand) --------
+def _generic_struct_expr(name: str, dtype: str, domain_re: str,
+                         target_domain: str) -> str:
+    """Apply regex to string fields in an unknown struct, pass through rest."""
+    struct_type = dtype.rstrip("[]")
+    fields = _parse_struct_fields(struct_type)
+    if not fields:
+        return f'"{name}"'
 
-    table = _apply_regex_patterns(
-        table, REGEX_PATTERNS, domain_pattern, target_domain,
-    )
+    parts = []
+    for fname, ftype in fields:
+        ref = f'"{name}"."{fname}"'
+        if "VARCHAR" in ftype and "STRUCT" not in ftype:
+            chain = _regex_chain_sql(ref, domain_re, target_domain)
+            parts.append(f'"{fname}" := {chain}')
+        else:
+            parts.append(f'"{fname}" := {ref}')
+    return f'struct_pack({", ".join(parts)}) AS "{name}"'
 
-    return table
+
+# -- Core masking function ------------------------------------------------- #
+
+def mask_parquet(con: duckdb.DuckDBPyConnection, src: str, dst: str,
+                 source_domain: str, target_domain: str) -> int:
+    """Mask PII in a single Parquet file using DuckDB SQL.
+
+    *src* and *dst* can be local file paths or ``s3://`` URLs.
+    Returns the number of rows written.
+    """
+    domain_re = source_domain.replace(".", r"\.")
+
+    # Escape single quotes in paths to prevent SQL injection
+    safe_src = src.replace("'", "''")
+    safe_dst = dst.replace("'", "''")
+
+    # Get schema from the parquet file
+    schema = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{safe_src}')"
+    ).fetchall()
+
+    exprs = []
+    for row in schema:
+        name, dtype = row[0], row[1]
+        exprs.append(_col_expr(name, dtype, domain_re, target_domain))
+
+    select_clause = ",\n        ".join(exprs)
+    sql = f"""
+        COPY (
+            SELECT {select_clause}
+            FROM read_parquet('{safe_src}')
+        ) TO '{safe_dst}' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED)
+    """
+
+    result = con.execute(sql)
+    return result.fetchone()[0]
+
+
+# -- S3 httpfs configuration ----------------------------------------------- #
+
+# Preferred spill directory (avoid RAM-backed /tmp on some systems)
+_SPILL_DIR = next((d for d in ("/var/tmp",) if os.path.isdir(d)), None)
+
+
+def _configure_connection(con: duckdb.DuckDBPyConnection,
+                          threads: int | None = None) -> None:
+    """Set DuckDB temp directory and thread limit.
+
+    *threads*: cap internal parallelism to avoid oversubscription when
+    running multiple workers.  None = DuckDB default (all cores).
+    """
+    if _SPILL_DIR:
+        con.execute(f"SET temp_directory = '{_SPILL_DIR}'")
+    if threads is not None:
+        con.execute(f"SET threads = {threads}")
+
+
+def _configure_httpfs(con: duckdb.DuckDBPyConnection,
+                      region: str | None = None) -> None:
+    """Install and configure httpfs for S3 access.
+
+    DuckDB picks up AWS credentials from environment variables
+    (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+    or the default credential provider chain.
+    """
+    con.install_extension("httpfs")
+    con.load_extension("httpfs")
+    if region:
+        con.execute(f"SET s3_region = '{region}'")
 
 
 # -- S3 pipeline ----------------------------------------------------------- #
 
-# Default workers: 6 fits comfortably on c5.4xlarge (16 vCPU, 32 GB RAM)
-# Each worker peaks at ~4.3 GB — 6 × 4.3 = 26 GB, leaves headroom.
-DEFAULT_WORKERS = 6
-
-
-def _mask_one_file(
-    src_bucket: str,
-    src_prefix: str,
-    dst_bucket: str,
-    dst_prefix: str,
-    key: str,
-    source_domain: str,
-    target_domain: str,
-) -> tuple[str, bool, str]:
-    """Worker function: download, mask, upload one Parquet file.
-
-    Creates its own S3Store instances (boto3 clients cannot be pickled
-    across process boundaries).  Returns (key, success, message).
-    """
-    try:
-        src = S3Store(bucket=src_bucket, prefix=src_prefix)
-        dst = S3Store(bucket=dst_bucket, prefix=dst_prefix)
-
-        table = _download_parquet(src, key)
-        if table is None:
-            return (key, True, "skipped (download failed)")
-
-        masked = mask_table(table, source_domain, target_domain)
-        _upload_parquet(dst, key, masked)
-
-        return (key, True, f"{table.num_rows:,} rows")
-    except Exception as exc:
-        return (key, False, str(exc))
+def _s3_url(store: S3Store, key: str) -> str:
+    """Build an s3:// URL for a key relative to the store."""
+    full_key = store._key(key)
+    return f"s3://{store.bucket}/{full_key}"
 
 
 def mask_bigquery_parquet(
@@ -340,8 +441,15 @@ def mask_bigquery_parquet(
     target_domain: str,
     checkpoint: CheckpointManager,
     max_workers: int = DEFAULT_WORKERS,
+    s3_region: str | None = None,
+    use_httpfs: bool = True,
 ):
-    """Mask all Parquet files under bigquery/{dataset}/events/."""
+    """Mask all Parquet files under bigquery/{dataset}/events/.
+
+    When *use_httpfs* is True (default), DuckDB reads/writes S3 directly
+    via httpfs — no temp files.  Set to False for testing with moto
+    (falls back to local temp files with boto3 download/upload).
+    """
     prefix = f"bigquery/{dataset}/events/"
     keys = [k for k in src.list_keys(prefix) if k.endswith(".parquet")]
     log.info("Found %d parquet files under %s", len(keys), prefix)
@@ -354,52 +462,56 @@ def mask_bigquery_parquet(
         log.info("Masking %d files (%d already done), workers=%d",
                  len(to_mask), already_done, max_workers)
 
-        if to_mask and max_workers > 1:
-            # Parallel: each worker creates its own S3Store (boto3
-            # clients cannot be pickled across process boundaries).
-            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        # Cap DuckDB's internal threads so N workers don't each grab
+        # all cores.  E.g. 16-core machine with 4 workers → 4 threads each.
+        cpu_count = os.cpu_count() or 4
+        threads_per_worker = max(1, cpu_count // max_workers)
+
+        if to_mask and max_workers > 1 and use_httpfs:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {
                     pool.submit(
-                        _mask_one_file,
-                        src.bucket, src.prefix,
-                        dst.bucket, dst.prefix,
-                        key, source_domain, target_domain,
+                        _mask_one_file_s3,
+                        src, dst, key,
+                        source_domain, target_domain, s3_region,
+                        threads_per_worker,
                     ): key
                     for key in to_mask
                 }
                 for future in as_completed(futures):
                     key = futures[future]
                     try:
-                        _, success, msg = future.result()
-                        if success:
-                            log.info("Masked %s — %s", key, msg)
-                        else:
-                            log.error("Failed %s — %s", key, msg)
+                        rows = future.result()
+                        log.info("Masked %s — %s rows", key, f"{rows:,}")
+                        checkpoint.mark_item_done("mask", key)
+                        checkpoint.save()
                     except Exception:
-                        log.error("Worker crashed on %s", key, exc_info=True)
-
+                        log.error("Failed %s", key, exc_info=True)
+        elif to_mask:
+            # Sequential: used for single-worker or local/test mode
+            con = duckdb.connect()
+            try:
+                _configure_connection(con)
+                if use_httpfs:
+                    _configure_httpfs(con, s3_region)
+                for key in to_mask:
+                    log.info("Masking %s", key)
+                    try:
+                        rows = _mask_one_file(
+                            con, src, dst, key,
+                            source_domain, target_domain, use_httpfs)
+                        log.info("Masked %s — %s rows", key, f"{rows:,}")
+                    except Exception:
+                        log.error("Failed %s", key, exc_info=True)
                     checkpoint.mark_item_done("mask", key)
                     checkpoint.save()
-        elif to_mask:
-            # Sequential: used when max_workers <= 1 (or in tests where
-            # moto mock_aws context cannot cross process boundaries).
-            for key in to_mask:
-                log.info("Masking %s", key)
-                table = _download_parquet(src, key)
-                if table is None:
-                    log.warning("Could not read %s, skipping", key)
-                else:
-                    masked = mask_table(table, source_domain, target_domain)
-                    _upload_parquet(dst, key, masked)
-                    log.info("Masked %s — %s rows", key,
-                             f"{table.num_rows:,}")
-                checkpoint.mark_item_done("mask", key)
-                checkpoint.save()
+            finally:
+                con.close()
 
         checkpoint.complete_phase("mask")
         checkpoint.save(force=True)
 
-    # Copy _stats.json if it exists (no masking needed, it has no PII)
+    # Copy _stats.json (no PII)
     stats_key = f"bigquery/{dataset}/_stats.json"
     stats = src.download_json(stats_key)
     if stats is not None:
@@ -410,44 +522,50 @@ def mask_bigquery_parquet(
     log.info("BigQuery masking complete for dataset %s", dataset)
 
 
-def _download_parquet(s3: S3Store, key: str) -> pa.Table | None:
-    """Download a Parquet file from S3 into an Arrow table."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False,
-                                      dir=_TMP_DIR)
+def _mask_one_file_s3(src: S3Store, dst: S3Store, key: str,
+                      source_domain: str, target_domain: str,
+                      s3_region: str | None,
+                      threads: int | None = None) -> int:
+    """Worker: mask one file via httpfs (each thread gets its own connection)."""
+    con = duckdb.connect()
     try:
-        tmp.close()
-        s3._client.download_file(
-            Bucket=s3.bucket,
-            Key=s3._key(key),
-            Filename=tmp.name,
-        )
-        return pq.read_table(tmp.name)
-    except Exception:
-        log.error("Failed to download %s", key, exc_info=True)
-        return None
+        _configure_connection(con, threads=threads)
+        _configure_httpfs(con, s3_region)
+        src_url = _s3_url(src, key)
+        dst_url = _s3_url(dst, key)
+        return mask_parquet(con, src_url, dst_url,
+                            source_domain, target_domain)
     finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        con.close()
 
 
-def _upload_parquet(s3: S3Store, key: str, table: pa.Table) -> None:
-    """Write an Arrow table to S3 as a Snappy-compressed Parquet file."""
-    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False,
-                                      dir=_TMP_DIR)
-    try:
-        tmp.close()
-        pq.write_table(table, tmp.name, compression="snappy")
-        s3.upload_file(
-            tmp.name, key,
-            content_type="application/vnd.apache.parquet",
-        )
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+def _mask_one_file(con: duckdb.DuckDBPyConnection, src: S3Store,
+                   dst: S3Store, key: str, source_domain: str,
+                   target_domain: str, use_httpfs: bool) -> int:
+    """Mask one file — httpfs or local fallback."""
+    if use_httpfs:
+        src_url = _s3_url(src, key)
+        dst_url = _s3_url(dst, key)
+        return mask_parquet(con, src_url, dst_url,
+                            source_domain, target_domain)
+    else:
+        # Local fallback (for testing with moto)
+        import tempfile
+        _TMP_DIR = next((d for d in ("/var/tmp",) if os.path.isdir(d)), None)
+        with tempfile.TemporaryDirectory(dir=_TMP_DIR) as tmpdir:
+            local_src = os.path.join(tmpdir, "input.parquet")
+            local_dst = os.path.join(tmpdir, "output.parquet")
+            src._client.download_file(
+                Bucket=src.bucket, Key=src._key(key),
+                Filename=local_src,
+            )
+            rows = mask_parquet(con, local_src, local_dst,
+                                source_domain, target_domain)
+            dst.upload_file(
+                local_dst, key,
+                content_type="application/vnd.apache.parquet",
+            )
+            return rows
 
 
 # -- CLI -------------------------------------------------------------------- #
@@ -457,7 +575,7 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="Mask PII in BigQuery Parquet exports",
+        description="Mask PII in BigQuery Parquet exports (DuckDB)",
     )
     parser.add_argument("--src-bucket", default=env("S3_BUCKET"),
                         help="Source S3 bucket (default: S3_BUCKET)")
@@ -476,15 +594,17 @@ def main():
     parser.add_argument("--max-workers", type=int,
                         default=env_int("PII_MAX_WORKERS", DEFAULT_WORKERS),
                         help=f"Parallel workers (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--s3-region", default=env("AWS_REGION"),
+                        help="AWS region for DuckDB httpfs")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true")
     parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"))
     args = parser.parse_args()
 
     if not args.src_bucket:
-        parser.error("--src-bucket is required (or set PII_SRC_BUCKET)")
+        parser.error("--src-bucket is required (or set S3_BUCKET)")
     if not args.dst_bucket:
-        parser.error("--dst-bucket is required (or set PII_DST_BUCKET)")
+        parser.error("--dst-bucket is required (or set S3_MASKED_BUCKET)")
     if not args.dataset:
         parser.error("--dataset is required (or set BIGQUERY_DATASET)")
 
@@ -501,7 +621,8 @@ def main():
 
     checkpoint.load()
 
-    log.info("Masking BigQuery dataset %s: %s -> %s (domain: %s -> %s, workers: %d)",
+    log.info("Masking BigQuery dataset %s: %s -> %s "
+             "(domain: %s -> %s, workers: %d)",
              args.dataset, args.src_bucket, args.dst_bucket,
              args.source_domain, args.target_domain, args.max_workers)
 
@@ -513,6 +634,7 @@ def main():
         target_domain=args.target_domain,
         checkpoint=checkpoint,
         max_workers=args.max_workers,
+        s3_region=args.s3_region,
     )
 
 
