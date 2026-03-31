@@ -1,11 +1,12 @@
 """Tests for exporters.bigquery — BigQueryExporter with mocked BQ client and moto S3."""
 
-import gzip
+import io
 import json
 from unittest.mock import MagicMock, patch
 
 import boto3
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from moto import mock_aws
 
@@ -93,15 +94,14 @@ def _make_exporter(s3_env, mock_client, **kwargs):
             return BigQueryExporter(**defaults)
 
 
-def _read_gzipped_ndjson(conn, s3_path):
-    """Download a gzipped NDJSON file from mock S3 and return parsed rows."""
+def _read_parquet(conn, s3_path):
+    """Download a Parquet file from mock S3 and return as Arrow table."""
     try:
         resp = conn.get_object(Bucket="test-bucket", Key=s3_path)
         data = resp["Body"].read()
     except conn.exceptions.NoSuchKey:
         return None
-    text = gzip.decompress(data).decode("utf-8")
-    return [json.loads(line) for line in text.strip().split("\n") if line.strip()]
+    return pq.read_table(io.BytesIO(data))
 
 
 def _download_raw(conn, s3_path):
@@ -116,7 +116,7 @@ def _download_raw(conn, s3_path):
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 class TestSingleDayExport:
-    def test_exports_single_day_to_gzipped_ndjson(self, s3_env):
+    def test_exports_single_day_to_parquet(self, s3_env):
         tables = {"20250401": _make_arrow_table(num_rows=5, date_str="20250401")}
         client = _mock_bq_client(tables)
         exporter = _make_exporter(s3_env, client, days=1, end_date="20250401")
@@ -124,12 +124,12 @@ class TestSingleDayExport:
         exporter.run()
 
         _, _, conn = s3_env
-        rows = _read_gzipped_ndjson(conn, f"bigquery/{DATASET}/events/20250401.ndjson.gz")
-        assert rows is not None
-        assert len(rows) == 5
-        assert rows[0]["event_name"] == "page_view"
-        assert rows[0]["event_date"] == "20250401"
-        assert rows[0]["platform"] == "WEB"
+        result = _read_parquet(conn, f"bigquery/{DATASET}/events/20250401.parquet")
+        assert result is not None
+        assert result.num_rows == 5
+        assert result.column("event_name").to_pylist() == ["page_view"] * 5
+        assert result.column("event_date").to_pylist() == ["20250401"] * 5
+        assert result.column("platform").to_pylist() == ["WEB"] * 5
 
     def test_stats_populated_after_export(self, s3_env):
         tables = {"20250401": _make_arrow_table(num_rows=20, date_str="20250401")}
@@ -145,8 +145,7 @@ class TestSingleDayExport:
         assert stats["target"] == f"{PROJECT}.{DATASET}"
         assert stats["events"]["total_rows"] == 20
         assert stats["events"]["days_exported"] == 1
-        assert stats["events"]["total_bytes_raw"] > 0
-        assert stats["events"]["total_bytes_gzipped"] > 0
+        assert stats["events"]["total_bytes"] > 0
         assert "exported_at" in stats
 
 
@@ -160,7 +159,7 @@ class TestMissingTable:
 
         _, _, conn = s3_env
         # No data file should exist
-        assert _download_raw(conn, f"bigquery/{DATASET}/events/20250401.ndjson.gz") is None
+        assert _download_raw(conn, f"bigquery/{DATASET}/events/20250401.parquet") is None
         # Stats should still exist but with 0 rows
         store, _, _ = s3_env
         stats = store.download_json(f"bigquery/{DATASET}/_stats.json")
@@ -194,9 +193,9 @@ class TestCheckpointResume:
         assert len(table_ids_called) == 0, "Day 20250401 should have been skipped"
 
         # Day 2 should be exported
-        rows = _read_gzipped_ndjson(conn, f"bigquery/{DATASET}/events/20250402.ndjson.gz")
-        assert rows is not None
-        assert len(rows) == 7
+        result = _read_parquet(conn, f"bigquery/{DATASET}/events/20250402.parquet")
+        assert result is not None
+        assert result.num_rows == 7
 
 
 class TestMultiDayExport:
@@ -215,9 +214,9 @@ class TestMultiDayExport:
 
         _, _, conn = s3_env
         for date_str, expected_rows in [("20250401", 3), ("20250402", 5), ("20250403", 8)]:
-            rows = _read_gzipped_ndjson(conn, f"bigquery/{DATASET}/events/{date_str}.ndjson.gz")
-            assert rows is not None, f"Missing data for {date_str}"
-            assert len(rows) == expected_rows, f"Wrong row count for {date_str}"
+            result = _read_parquet(conn, f"bigquery/{DATASET}/events/{date_str}.parquet")
+            assert result is not None, f"Missing data for {date_str}"
+            assert result.num_rows == expected_rows, f"Wrong row count for {date_str}"
 
     def test_stats_accumulated_across_days(self, s3_env):
         tables = {
@@ -235,8 +234,8 @@ class TestMultiDayExport:
         assert stats["events"]["days_exported"] == 2
 
 
-class TestGzipValidity:
-    def test_output_is_valid_gzip_with_valid_ndjson(self, s3_env):
+class TestParquetValidity:
+    def test_output_is_valid_parquet_with_correct_schema(self, s3_env):
         tables = {"20250401": _make_arrow_table(num_rows=3, date_str="20250401")}
         client = _mock_bq_client(tables)
         exporter = _make_exporter(s3_env, client, days=1, end_date="20250401")
@@ -244,17 +243,28 @@ class TestGzipValidity:
         exporter.run()
 
         _, _, conn = s3_env
-        raw = _download_raw(conn, f"bigquery/{DATASET}/events/20250401.ndjson.gz")
-        assert raw is not None
+        result = _read_parquet(conn, f"bigquery/{DATASET}/events/20250401.parquet")
+        assert result is not None
+        assert result.num_rows == 3
 
-        # Verify gzip decompresses
-        text = gzip.decompress(raw).decode("utf-8")
-        lines = [l for l in text.split("\n") if l.strip()]
-        assert len(lines) == 3
+        # Verify schema
+        names = result.schema.names
+        assert "event_date" in names
+        assert "event_name" in names
+        assert "user_pseudo_id" in names
+        assert "event_timestamp" in names
+        assert "platform" in names
 
-        # Verify each line is valid JSON
-        for line in lines:
-            row = json.loads(line)
-            assert "event_date" in row
-            assert "event_name" in row
-            assert "user_pseudo_id" in row
+    def test_parquet_uses_snappy_compression(self, s3_env):
+        tables = {"20250401": _make_arrow_table(num_rows=100, date_str="20250401")}
+        client = _mock_bq_client(tables)
+        exporter = _make_exporter(s3_env, client, days=1, end_date="20250401")
+
+        exporter.run()
+
+        _, _, conn = s3_env
+        raw = _download_raw(conn, f"bigquery/{DATASET}/events/20250401.parquet")
+        pf = pq.ParquetFile(io.BytesIO(raw))
+        # Check that compression is snappy
+        col_meta = pf.metadata.row_group(0).column(0)
+        assert col_meta.compression == "SNAPPY"
