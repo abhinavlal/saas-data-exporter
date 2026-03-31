@@ -594,7 +594,8 @@ def main():
     parser.add_argument("--max-workers", type=int,
                         default=env_int("PII_MAX_WORKERS", DEFAULT_WORKERS),
                         help=f"Parallel workers (default: {DEFAULT_WORKERS})")
-    parser.add_argument("--s3-region", default=env("AWS_REGION"),
+    parser.add_argument("--s3-region",
+                        default=env("AWS_DEFAULT_REGION"),
                         help="AWS region for DuckDB httpfs")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true")
