@@ -9,6 +9,10 @@ dependencies = [
     "google-auth>=2.23",
     "google-auth-httplib2>=0.2",
     "PyJWT[crypto]>=2.8",
+    "google-cloud-bigquery>=3.20",
+    "google-cloud-bigquery-storage>=2.24",
+    "pyarrow>=15.0",
+    "orjson>=3.11.7",
 ]
 
 [project.optional-dependencies]

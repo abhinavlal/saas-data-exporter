@@ -1,6 +1,6 @@
 # Data Exporter
 
-Batch data exporter for GitHub, Google Workspace, Jira, Slack, and Confluence. Exports structured JSON data to S3 with per-item files, checkpointing, rate limiting, and parallel execution.
+Batch data exporter for GitHub, Google Workspace, Jira, Slack, Confluence, and BigQuery (GA4). Exports structured JSON data to S3 with per-item files, checkpointing, rate limiting, and parallel execution.
 
 ## Quick Start
 
@@ -12,6 +12,7 @@ uv run python -m exporters.jira                # export Jira projects
 uv run python -m exporters.slack               # export Slack channels
 uv run python -m exporters.google_workspace    # export Google Workspace users
 uv run python -m exporters.confluence          # export Confluence spaces
+uv run python -m exporters.bigquery            # export GA4 events from BigQuery
 ```
 
 Check export progress:
@@ -161,6 +162,25 @@ Uses the same Atlassian credentials as Jira by default.
 | `--body-format` | `storage` | `storage` (XHTML) or `atlas_doc_format` (ADF JSON) |
 | `--parallel` | `1` | Spaces to export simultaneously |
 
+### BigQuery (GA4)
+
+Exports GA4 daily event tables from BigQuery to gzipped NDJSON in S3. Uses the BigQuery Storage Read API for high-throughput streaming.
+
+```bash
+uv run python -m exporters.bigquery
+```
+
+Requires a GCP service account key with BigQuery read access. See [Google Service Account Setup](docs/google-service-account-setup.md).
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--key` | `BIGQUERY_KEY` | Path to service account JSON key |
+| `--project` | `BIGQUERY_PROJECT` | GCP project ID |
+| `--dataset` | `BIGQUERY_DATASET` | BigQuery dataset ID |
+| `--days` | `365` | Number of days to export |
+| `--end-date` | yesterday | End date in `YYYYMMDD` format |
+| `--parallel` | `4` | Days to export simultaneously |
+
 ## S3 Output Structure
 
 Every item is its own JSON file. No combined arrays.
@@ -197,6 +217,9 @@ s3://{bucket}/{prefix}/
     pages/{page_id}.json
     pages/_index.json
     attachments/{page_id}/{file}
+    _stats.json
+  bigquery/{dataset}/
+    events/{YYYYMMDD}.ndjson.gz
     _stats.json
   _checkpoints/{exporter}/{target}.json
 ```

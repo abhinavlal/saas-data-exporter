@@ -26,6 +26,7 @@ exporters/github.py           python -m exporters.github
 exporters/jira.py             python -m exporters.jira
 exporters/slack.py            python -m exporters.slack
 exporters/google_workspace.py python -m exporters.google_workspace
+exporters/bigquery.py         python -m exporters.bigquery
 ```
 
 **Shared lib modules:** `s3.py` (S3Store, NDJSONWriter), `checkpoint.py` (resumable state), `session.py` (rate-limited HTTP), `rate_limit.py` (TokenBucket), `retry.py` (@retry decorator), `config.py` (.env loader), `input.py` (CSV reader), `logging.py` (JSON formatter), `types.py` (ExportConfig).
