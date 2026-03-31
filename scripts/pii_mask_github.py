@@ -66,8 +66,15 @@ def _hash_url(url: str) -> str:
     return url
 
 
+def _hash_text(text: str) -> str:
+    """Hash the entire text content. Deterministic."""
+    if not text:
+        return text
+    return _hash(text, 24)
+
+
 def _mask_body(text: str) -> str:
-    """Replace @mentions and emails in freeform text."""
+    """Replace @mentions and emails in freeform text (for fields we keep readable)."""
     if not text:
         return text
     # @username mentions
@@ -91,21 +98,21 @@ def mask_pr(pr: dict) -> dict:
     pr["requested_reviewers"] = [_hash_login(r)
                                  for r in pr.get("requested_reviewers", [])]
 
-    pr["title"] = _mask_body(pr.get("title", ""))
-    pr["body"] = _mask_body(pr.get("body", ""))
+    pr["title"] = _hash_text(pr.get("title", ""))
+    pr["body"] = _hash_text(pr.get("body", ""))
     pr["html_url"] = _hash_url(pr.get("html_url", ""))
 
     for review in pr.get("reviews", []):
         review["reviewer"] = _hash_login(review.get("reviewer", ""))
-        review["body"] = _mask_body(review.get("body", ""))
+        review["body"] = _hash_text(review.get("body", ""))
 
     for rc in pr.get("review_comments", []):
         rc["author"] = _hash_login(rc.get("author", ""))
-        rc["body"] = _mask_body(rc.get("body", ""))
+        rc["body"] = _hash_text(rc.get("body", ""))
 
     for comment in pr.get("comments", []):
         comment["author"] = _hash_login(comment.get("author", ""))
-        comment["body"] = _mask_body(comment.get("body", ""))
+        comment["body"] = _hash_text(comment.get("body", ""))
 
     for commit in pr.get("commits", []):
         _mask_commit_fields(commit)
@@ -126,7 +133,7 @@ def _mask_commit_fields(commit: dict) -> None:
     if "committer_login" in commit:
         commit["committer_login"] = _hash_login(
             commit.get("committer_login", ""))
-    commit["message"] = _mask_body(commit.get("message", ""))
+    commit["message"] = _hash_text(commit.get("message", ""))
 
 
 def mask_contributors(contributors: list) -> list:
@@ -145,7 +152,7 @@ def mask_repo_metadata(meta: dict) -> dict:
         parts = meta["full_name"].split("/", 1)
         meta["full_name"] = f"{_hash_login(parts[0])}/{parts[1]}" \
             if len(parts) == 2 else _hash(meta["full_name"])
-    meta["description"] = _mask_body(meta.get("description", ""))
+    meta["description"] = _hash_text(meta.get("description", ""))
     return meta
 
 
@@ -239,10 +246,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Mask PII in GitHub JSON exports (deterministic hashing)",
     )
-    parser.add_argument("--src-bucket", default=env("PII_SRC_BUCKET"),
-                        help="Source S3 bucket with raw exports")
-    parser.add_argument("--dst-bucket", default=env("PII_DST_BUCKET"),
-                        help="Destination S3 bucket for masked output")
+    parser.add_argument("--src-bucket", default=env("S3_BUCKET"),
+                        help="Source S3 bucket (default: S3_BUCKET)")
+    parser.add_argument("--dst-bucket", default=env("S3_MASKED_BUCKET"),
+                        help="Destination S3 bucket (default: S3_MASKED_BUCKET)")
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""),
                         help="S3 key prefix")
     parser.add_argument("--max-workers", type=int,

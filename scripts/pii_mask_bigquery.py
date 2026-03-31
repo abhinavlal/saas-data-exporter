@@ -459,10 +459,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Mask PII in BigQuery Parquet exports",
     )
-    parser.add_argument("--src-bucket", default=env("PII_SRC_BUCKET"),
-                        help="Source S3 bucket with raw exports")
-    parser.add_argument("--dst-bucket", default=env("PII_DST_BUCKET"),
-                        help="Destination S3 bucket for masked output")
+    parser.add_argument("--src-bucket", default=env("S3_BUCKET"),
+                        help="Source S3 bucket (default: S3_BUCKET)")
+    parser.add_argument("--dst-bucket", default=env("S3_MASKED_BUCKET"),
+                        help="Destination S3 bucket (default: S3_MASKED_BUCKET)")
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""),
                         help="S3 key prefix (shared by src and dst)")
     parser.add_argument("--dataset", default=env("BIGQUERY_DATASET"),

@@ -8,7 +8,8 @@ from moto import mock_aws
 
 from lib.s3 import S3Store
 from scripts.pii_mask_github import (
-    _hash, _hash_email, _hash_login, _hash_name, _hash_url, _mask_body,
+    _hash, _hash_email, _hash_login, _hash_name, _hash_url,
+    _hash_text, _mask_body,
     mask_pr, mask_contributors, mask_repo_metadata,
     mask_github_exports,
 )
@@ -150,35 +151,43 @@ class TestMaskPR:
         assert "alice" not in str(pr["assignees"])
         assert all(r.startswith("user-") for r in pr["requested_reviewers"])
 
-    def test_masks_body_and_title(self):
+    def test_hashes_title_and_body(self):
         pr = mask_pr(self._sample_pr())
-        assert "@johndoe" not in pr["title"]
-        assert "john@practo.com" not in pr["body"]
+        # Title and body are fully hashed (not just @mention replacement)
+        assert pr["title"] != "Fix bug reported by @johndoe"
+        assert pr["body"] != "See john@practo.com for context"
+        assert len(pr["title"]) == 24  # hash length
+        assert len(pr["body"]) == 24
 
-    def test_masks_reviews(self):
+    def test_hashes_review_body(self):
         pr = mask_pr(self._sample_pr())
         review = pr["reviews"][0]
         assert "alice" not in review["reviewer"]
-        assert "@amitchhajer" not in review["body"]
+        assert review["body"] != "LGTM @amitchhajer"
+        assert len(review["body"]) == 24
 
-    def test_masks_review_comments(self):
+    def test_hashes_review_comment_body(self):
         pr = mask_pr(self._sample_pr())
         rc = pr["review_comments"][0]
         assert "bob" not in rc["author"]
+        assert rc["body"] != "nit: rename this var"
+        assert len(rc["body"]) == 24
 
-    def test_masks_comments(self):
+    def test_hashes_comment_body(self):
         pr = mask_pr(self._sample_pr())
         c = pr["comments"][0]
         assert "charlie" not in c["author"]
-        assert "@alice" not in c["body"]
+        assert c["body"] != "ping @alice"
+        assert len(c["body"]) == 24
 
-    def test_masks_commit_fields(self):
+    def test_hashes_commit_message(self):
         pr = mask_pr(self._sample_pr())
         commit = pr["commits"][0]
         assert "Amit" not in commit["author_name"]
         assert "amit@practo.com" not in commit["author_email"]
         assert "amitchhajer" not in commit["author_login"]
-        assert "@johndoe" not in commit["message"]
+        assert commit["message"] != "fix for @johndoe"
+        assert len(commit["message"]) == 24
 
     def test_preserves_non_pii_fields(self):
         pr = mask_pr(self._sample_pr())
@@ -219,11 +228,13 @@ class TestMaskRepoMetadata:
     def test_masks_org_in_full_name(self):
         meta = mask_repo_metadata({
             "full_name": "practo/MyRepo",
-            "description": "Contact @admin for help",
+            "description": "Contact admin for help",
         })
         assert "practo" not in meta["full_name"]
         assert "/MyRepo" in meta["full_name"]
-        assert "@admin" not in meta["description"]
+        # description is fully hashed
+        assert meta["description"] != "Contact admin for help"
+        assert len(meta["description"]) == 24
 
 
 # ── Integration: full pipeline ────────────────────────────────────────────
