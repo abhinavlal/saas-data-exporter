@@ -1,14 +1,14 @@
-"""BigQuery GA4 Exporter — exports daily GA4 event tables to S3 as gzipped NDJSON."""
+"""BigQuery GA4 Exporter — exports daily GA4 event tables to S3 as Parquet."""
 
 import argparse
-import gzip
 import logging
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-import orjson
+import pyarrow as pa
+import pyarrow.parquet as pq
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -29,7 +29,7 @@ _TMP_DIR = next((d for d in ("/var/tmp",) if os.path.isdir(d)), None)
 # -- Exporter --------------------------------------------------------------- #
 
 class BigQueryExporter:
-    """Exports GA4 daily event tables from BigQuery to S3 as gzipped NDJSON."""
+    """Exports GA4 daily event tables from BigQuery to S3 as Parquet."""
 
     def __init__(
         self,
@@ -128,10 +128,10 @@ class BigQueryExporter:
     # -- Single-day export (performance-critical) --------------------------- #
 
     def _export_one_day(self, date_str: str):
-        """Export one daily table to gzipped NDJSON in S3.
+        """Export one daily table to Parquet in S3.
 
-        Optimized path: Arrow batches -> orjson -> streaming gzip -> S3.
-        Single-pass: no intermediate uncompressed file on disk.
+        Optimized path: Arrow batches streamed directly to Parquet writer.
+        No Python dict conversion — stays in Arrow columnar format end-to-end.
         """
         table_id = f"{self.project}.{self.dataset}.{self.table_prefix}{date_str}"
 
@@ -145,54 +145,53 @@ class BigQueryExporter:
         row_count = table.num_rows
         log.info("Exporting %s (%s rows)", table_id, f"{row_count:,}")
 
-        # Stream rows via Storage Read API -> Arrow batches -> orjson -> gzip
-        s3_path = f"{self.s3_base}/events/{date_str}.ndjson.gz"
+        s3_path = f"{self.s3_base}/events/{date_str}.parquet"
         rows_written = 0
-        bytes_written = 0
 
-        # Single-pass: write gzip directly to temp file (no uncompressed copy)
-        tmp_gz = tempfile.NamedTemporaryFile(
-            suffix=".ndjson.gz", delete=False, dir=_TMP_DIR,
+        tmp_pq = tempfile.NamedTemporaryFile(
+            suffix=".parquet", delete=False, dir=_TMP_DIR,
         )
         try:
-            with gzip.open(tmp_gz.name, "wb", compresslevel=4) as gz:
-                # list_rows with Storage Read API (auto-enabled when
-                # google-cloud-bigquery-storage + pyarrow are installed)
-                row_iter = self.client.list_rows(table)
+            # Stream Arrow batches from BQ Storage Read API directly to
+            # Parquet writer — zero Python dict conversion, columnar
+            # end-to-end with snappy compression.
+            row_iter = self.client.list_rows(table)
+            writer = None
 
-                for batch in row_iter.to_arrow_iterable():
-                    # orjson handles date/datetime/bytes natively,
-                    # OPT_NON_STR_KEYS handles int keys in nested structs
-                    for row in batch.to_pylist():
-                        line = orjson.dumps(
-                            row, option=orjson.OPT_NON_STR_KEYS,
-                        )
-                        gz.write(line)
-                        gz.write(b"\n")
-                        rows_written += 1
-                        bytes_written += len(line) + 1
+            for batch in row_iter.to_arrow_iterable():
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        tmp_pq.name, batch.schema,
+                        compression="snappy",
+                    )
+                writer.write_batch(batch)
+                rows_written += batch.num_rows
 
-            # Upload gzipped file to S3
-            gz_size = os.path.getsize(tmp_gz.name)
+            if writer is not None:
+                writer.close()
+
+            tmp_pq.close()
+
+            # Upload parquet file to S3
+            file_size = os.path.getsize(tmp_pq.name)
             self.s3.upload_file(
-                tmp_gz.name, s3_path,
-                content_type="application/gzip",
+                tmp_pq.name, s3_path,
+                content_type="application/vnd.apache.parquet",
             )
 
-            log.info("Exported %s: %s rows, %s raw, %s gzipped",
+            log.info("Exported %s: %s rows, %s parquet",
                      date_str, f"{rows_written:,}",
-                     _human_bytes(bytes_written), _human_bytes(gz_size))
+                     _human_bytes(file_size))
 
-            # Update stats (thread-safe via StatsCollector's internal locking)
+            # Update stats
             self.stats.increment("events.total_rows", rows_written)
-            self.stats.increment("events.total_bytes_raw", bytes_written)
-            self.stats.increment("events.total_bytes_gzipped", gz_size)
+            self.stats.increment("events.total_bytes", file_size)
             self.stats.increment("events.days_exported")
             self.stats.save()
 
         finally:
             try:
-                os.unlink(tmp_gz.name)
+                os.unlink(tmp_pq.name)
             except OSError:
                 pass
 
@@ -214,7 +213,7 @@ def main():
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="Export GA4 event data from BigQuery to S3",
+        description="Export GA4 event data from BigQuery to S3 as Parquet",
     )
     parser.add_argument("--key", default=env("BIGQUERY_KEY"),
                         help="Path to service account JSON key")
