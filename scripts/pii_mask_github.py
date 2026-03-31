@@ -26,6 +26,10 @@ DEFAULT_WORKERS = 32
 DEFAULT_SOURCE_DOMAIN = "org_name.com"
 DEFAULT_TARGET_DOMAIN = "example-health.com"
 
+# Org name replacement in S3 keys and document content
+_ORG_SOURCE = "org_name"
+_ORG_TARGET = "medica"
+
 # Salt prefix for hashing — prevents rainbow table reversal.
 # Not a secret, just domain separation.
 _HASH_SALT = "pii-mask-github-v1:"
@@ -156,6 +160,26 @@ def mask_repo_metadata(meta: dict) -> dict:
     return meta
 
 
+# -- Org name replacement in all strings ----------------------------------- #
+
+def _replace_org_in_obj(obj):
+    """Recursively replace _ORG_SOURCE with _ORG_TARGET in all string values."""
+    if isinstance(obj, str):
+        return obj.replace(_ORG_SOURCE, _ORG_TARGET).replace(
+            _ORG_SOURCE.capitalize(), _ORG_TARGET.capitalize()).replace(
+            _ORG_SOURCE.upper(), _ORG_TARGET.upper())
+    if isinstance(obj, dict):
+        return {k: _replace_org_in_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_replace_org_in_obj(v) for v in obj]
+    return obj
+
+
+def _rewrite_key(key: str) -> str:
+    """Rewrite S3 key: github/org_name__Repo → github/medica__Repo."""
+    return key.replace(f"{_ORG_SOURCE}__", f"{_ORG_TARGET}__")
+
+
 # -- S3 pipeline ----------------------------------------------------------- #
 
 def _mask_one_file(src: S3Store, dst: S3Store, key: str) -> str:
@@ -177,7 +201,12 @@ def _mask_one_file(src: S3Store, dst: S3Store, key: str) -> str:
     else:
         return "skipped (unknown type)"
 
-    dst.upload_json(data, key)
+    # Replace org name in all remaining string values
+    data = _replace_org_in_obj(data)
+
+    # Write to destination with rewritten key
+    dst_key = _rewrite_key(key)
+    dst.upload_json(data, dst_key)
     return "ok"
 
 
