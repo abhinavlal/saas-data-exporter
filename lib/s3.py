@@ -67,7 +67,7 @@ class S3Store:
             "s3",
             config=BotocoreConfig(
                 retries={"max_attempts": 5, "mode": "adaptive"},
-                max_pool_connections=50,
+                max_pool_connections=200,
             ),
         )
         self.bucket = bucket

@@ -59,6 +59,10 @@ SKIP_DRIVE_TYPES = {
 }
 
 
+class _PermanentDriveError(Exception):
+    """Non-retryable Drive errors (file too large to export, not downloadable)."""
+
+
 def _user_slug(email_addr: str) -> str:
     return email_addr.replace("@", "_at_")
 
@@ -419,6 +423,10 @@ class GoogleWorkspaceExporter:
                     self._download_drive_file(service, file_meta)
                 entry = self._drive_index_entry(file_meta, downloaded=True)
                 index.append(entry)
+            except _PermanentDriveError as e:
+                log.warning("Skipping Drive file %s: %s", file_meta.get("name"), e)
+                entry = self._drive_index_entry(file_meta, downloaded=False, reason="permanent_error")
+                index.append(entry)
             except Exception:
                 log.error("Failed to download Drive file %s", file_meta.get("name"), exc_info=True)
                 entry = self._drive_index_entry(file_meta, downloaded=False, reason="error")
@@ -487,13 +495,18 @@ class GoogleWorkspaceExporter:
         request = service.files().export_media(fileId=file_meta["id"], mimeType=export_mime)
         request.uri += f"&quotaUser={self.user}"
         safe_name = f"{file_meta['id']}_{sanitize_filename(name)}"
-        with tempfile.NamedTemporaryFile(delete=True) as tmp:
-            downloader = MediaIoBaseDownload(tmp, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            tmp.flush()
-            self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{safe_name}")
+        try:
+            with tempfile.NamedTemporaryFile(delete=True) as tmp:
+                downloader = MediaIoBaseDownload(tmp, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                tmp.flush()
+                self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{safe_name}")
+        except HttpError as e:
+            if e.resp.status == 403 and e.reason in ("exportSizeLimitExceeded", "fileNotDownloadable"):
+                raise _PermanentDriveError(str(e)) from e
+            raise
 
     @retry(max_attempts=3, backoff_base=2.0, exceptions=(HttpError, IOError))
     def _download_drive_file(self, service, file_meta: dict) -> None:
@@ -505,13 +518,18 @@ class GoogleWorkspaceExporter:
         request = service.files().get_media(fileId=file_meta["id"])
         request.uri += f"&quotaUser={self.user}"
         safe_name = f"{file_meta['id']}_{sanitize_filename(name)}"
-        with tempfile.NamedTemporaryFile(delete=True) as tmp:
-            downloader = MediaIoBaseDownload(tmp, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            tmp.flush()
-            self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{safe_name}")
+        try:
+            with tempfile.NamedTemporaryFile(delete=True) as tmp:
+                downloader = MediaIoBaseDownload(tmp, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                tmp.flush()
+                self.s3.upload_file(tmp.name, f"{self.s3_base}/drive/{safe_name}")
+        except HttpError as e:
+            if e.resp.status == 403 and e.reason in ("exportSizeLimitExceeded", "fileNotDownloadable"):
+                raise _PermanentDriveError(str(e)) from e
+            raise
 
     def _drive_index_entry(self, file_meta: dict, downloaded: bool,
                            reason: str | None = None) -> dict:
