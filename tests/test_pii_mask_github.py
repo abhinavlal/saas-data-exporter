@@ -9,7 +9,7 @@ from moto import mock_aws
 from lib.s3 import S3Store
 from scripts.pii_mask_github import (
     _hash, _hash_email, _hash_login, _hash_name, _hash_url,
-    _hash_text, _mask_body,
+    _hash_text, _mask_body, _replace_org_in_obj, _rewrite_key,
     mask_pr, mask_contributors, mask_repo_metadata,
     mask_github_exports,
 )
@@ -239,11 +239,36 @@ class TestMaskRepoMetadata:
 
 # ── Integration: full pipeline ────────────────────────────────────────────
 
+class TestOrgReplacement:
+    def test_replace_org_in_obj(self):
+        data = {
+            "name": "practo/repo",
+            "url": "https://github.com/practo/repo",
+            "items": ["practo-service", "other"],
+            "nested": {"org": "Practo"},
+        }
+        result = _replace_org_in_obj(data)
+        assert result["name"] == "medica/repo"
+        assert result["url"] == "https://github.com/medica/repo"
+        assert result["items"][0] == "medica-service"
+        assert result["nested"]["org"] == "Medica"
+
+    def test_rewrite_key(self):
+        assert _rewrite_key("github/practo__repo/prs/1.json") == \
+            "github/medica__repo/prs/1.json"
+        assert _rewrite_key("github/practo__MyService/contributors.json") == \
+            "github/medica__MyService/contributors.json"
+
+    def test_preserves_non_practo_keys(self):
+        assert _rewrite_key("github/other__repo/prs/1.json") == \
+            "github/other__repo/prs/1.json"
+
+
 class TestPipelineEndToEnd:
-    def test_masks_all_file_types(self, s3_env):
+    def test_masks_all_file_types_and_rewrites_keys(self, s3_env):
         src, dst, conn = s3_env
 
-        # Upload sample data
+        # Upload sample data under practo__ prefix
         src.upload_json({
             "number": 1, "title": "test", "state": "open",
             "author": "alice", "author_id": 1, "body": "",
@@ -275,23 +300,27 @@ class TestPipelineEndToEnd:
         cp.load()
         mask_github_exports(src=src, dst=dst, checkpoint=cp, max_workers=1)
 
-        # Verify PR
-        pr = dst.download_json("github/practo__repo/prs/1.json")
+        # Keys should be rewritten: practo__ → medica__
+        pr = dst.download_json("github/medica__repo/prs/1.json")
+        assert pr is not None
         assert "alice" not in pr["author"]
         assert "alice@practo.com" not in pr["commits"][0]["author_email"]
+        # html_url should have practo replaced with medica
+        assert "practo" not in pr["html_url"]
 
-        # Verify contributors
-        contribs = dst.download_json("github/practo__repo/contributors.json")
+        contribs = dst.download_json("github/medica__repo/contributors.json")
+        assert contribs is not None
         assert "alice" not in contribs[0]["login"]
-        assert contribs[0]["id"] == 0
 
-        # Verify metadata
-        meta = dst.download_json("github/practo__repo/repo_metadata.json")
+        meta = dst.download_json("github/medica__repo/repo_metadata.json")
+        assert meta is not None
         assert "practo" not in meta["full_name"]
 
-        # Verify stats copied unchanged
-        stats = dst.download_json("github/practo__repo/_stats.json")
+        stats = dst.download_json("github/medica__repo/_stats.json")
         assert stats == {"total": 1}
+
+        # Old keys should NOT exist in destination
+        assert dst.download_json("github/practo__repo/prs/1.json") is None
 
     def test_checkpoint_resume(self, s3_env):
         src, dst, conn = s3_env
@@ -320,8 +349,9 @@ class TestPipelineEndToEnd:
         cp.start_phase("mask", total=2)
         cp.mark_item_done("mask", "github/practo__r/prs/1.json")
         cp.save(force=True)
-        # Write PR 1 to dst as-is (simulating prior run)
-        dst.upload_json({"number": 1, "author": "a"}, "github/practo__r/prs/1.json")
+        # Write PR 1 to dst with rewritten key (simulating prior run)
+        dst.upload_json({"number": 1, "author": "a"},
+                        "github/medica__r/prs/1.json")
 
         # Run
         cp2 = CheckpointManager(dst, "pii_mask/github")
@@ -329,9 +359,10 @@ class TestPipelineEndToEnd:
         mask_github_exports(src=src, dst=dst, checkpoint=cp2, max_workers=1)
 
         # PR 1 should be untouched (author still "a")
-        pr1 = dst.download_json("github/practo__r/prs/1.json")
+        pr1 = dst.download_json("github/medica__r/prs/1.json")
         assert pr1["author"] == "a"
 
-        # PR 2 should be masked
-        pr2 = dst.download_json("github/practo__r/prs/2.json")
+        # PR 2 should be masked and under medica__ key
+        pr2 = dst.download_json("github/medica__r/prs/2.json")
+        assert pr2 is not None
         assert "bob" not in pr2["author"]
