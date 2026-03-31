@@ -144,6 +144,28 @@ class TestStructMasking:
         assert rows[1]["source"] == "other.com"
 
 
+# ── List-of-structs columns (e.g. items) ──────────────────────────────────
+
+class TestListOfStructsPassthrough:
+    def test_items_list_passes_through(self, con, tmp_path):
+        """GA4 'items' column is STRUCT(...)[] — must not attempt field access."""
+        item_type = pa.struct([
+            pa.field("item_id", pa.string()),
+            pa.field("item_name", pa.string()),
+            pa.field("price", pa.float64()),
+        ])
+        table = pa.table({
+            "event_name": ["purchase"],
+            "items": pa.array([
+                [{"item_id": "SKU-001", "item_name": "Widget", "price": 9.99}],
+            ], type=pa.list_(item_type)),
+        })
+        result = _mask(con, tmp_path, table)
+        items = result.column("items").to_pylist()[0]
+        assert items[0]["item_id"] == "SKU-001"
+        assert items[0]["price"] == 9.99
+
+
 # ── Geo redaction ─────────────────────────────────────────────────────────
 
 class TestGeoRedaction:
