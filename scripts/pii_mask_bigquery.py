@@ -170,11 +170,11 @@ def _col_expr(name: str, dtype: str, domain_re: str,
         chain = _regex_chain_sql(f'"{name}"', domain_re, target_domain)
         return f'{chain} AS "{name}"'
 
-    if dtype.startswith("STRUCT"):
-        # Unknown struct: apply regex to string fields, pass through others
+    if dtype.startswith("STRUCT") and not dtype.endswith("[]"):
+        # Unknown struct (non-list): apply regex to string fields
         return _generic_struct_expr(name, dtype, domain_re, target_domain)
 
-    # Non-string (int, float, bool, timestamp, etc.) — pass through
+    # Lists (STRUCT(...)[], VARCHAR[], etc.), ints, floats, etc. — pass through
     return f'"{name}"'
 
 
