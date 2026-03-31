@@ -404,6 +404,7 @@ class TestPipelineEndToEnd:
             source_domain="org_name.com",
             target_domain="example-health.com",
             checkpoint=cp,
+            max_workers=1,
         )
 
         result = _download_parquet(conn, DST_BUCKET,
@@ -453,6 +454,7 @@ class TestPipelineEndToEnd:
             source_domain="org_name.com",
             target_domain="example-health.com",
             checkpoint=cp2,
+            max_workers=1,
         )
 
         # Day 1 untouched (still "original")

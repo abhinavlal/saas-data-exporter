@@ -4,6 +4,9 @@ Reads BigQuery GA4 Parquet exports from a source S3 bucket, masks all
 PII (domains, user identifiers, doctor names in URLs, geo locations,
 tracking IDs, sensitive URL paths), and writes masked Parquet files to
 a destination S3 bucket.
+
+Parallelized with ProcessPoolExecutor — each worker independently
+downloads, masks, and uploads one Parquet file.
 """
 
 import argparse
@@ -11,6 +14,7 @@ import logging
 import os
 import secrets
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -293,6 +297,41 @@ def mask_table(table: pa.Table, source_domain: str,
 
 # -- S3 pipeline ----------------------------------------------------------- #
 
+# Default workers: 6 fits comfortably on c5.4xlarge (16 vCPU, 32 GB RAM)
+# Each worker peaks at ~4.3 GB — 6 × 4.3 = 26 GB, leaves headroom.
+DEFAULT_WORKERS = 6
+
+
+def _mask_one_file(
+    src_bucket: str,
+    src_prefix: str,
+    dst_bucket: str,
+    dst_prefix: str,
+    key: str,
+    source_domain: str,
+    target_domain: str,
+) -> tuple[str, bool, str]:
+    """Worker function: download, mask, upload one Parquet file.
+
+    Creates its own S3Store instances (boto3 clients cannot be pickled
+    across process boundaries).  Returns (key, success, message).
+    """
+    try:
+        src = S3Store(bucket=src_bucket, prefix=src_prefix)
+        dst = S3Store(bucket=dst_bucket, prefix=dst_prefix)
+
+        table = _download_parquet(src, key)
+        if table is None:
+            return (key, True, "skipped (download failed)")
+
+        masked = mask_table(table, source_domain, target_domain)
+        _upload_parquet(dst, key, masked)
+
+        return (key, True, f"{table.num_rows:,} rows")
+    except Exception as exc:
+        return (key, False, str(exc))
+
+
 def mask_bigquery_parquet(
     src: S3Store,
     dst: S3Store,
@@ -300,6 +339,7 @@ def mask_bigquery_parquet(
     source_domain: str,
     target_domain: str,
     checkpoint: CheckpointManager,
+    max_workers: int = DEFAULT_WORKERS,
 ):
     """Mask all Parquet files under bigquery/{dataset}/events/."""
     prefix = f"bigquery/{dataset}/events/"
@@ -309,23 +349,52 @@ def mask_bigquery_parquet(
     if not checkpoint.is_phase_done("mask"):
         checkpoint.start_phase("mask", total=len(keys))
 
-        for key in keys:
-            if checkpoint.is_item_done("mask", key):
-                continue
+        to_mask = [k for k in keys if not checkpoint.is_item_done("mask", k)]
+        already_done = len(keys) - len(to_mask)
+        log.info("Masking %d files (%d already done), workers=%d",
+                 len(to_mask), already_done, max_workers)
 
-            log.info("Masking %s", key)
-            table = _download_parquet(src, key)
-            if table is None:
-                log.warning("Could not read %s, skipping", key)
+        if to_mask and max_workers > 1:
+            # Parallel: each worker creates its own S3Store (boto3
+            # clients cannot be pickled across process boundaries).
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _mask_one_file,
+                        src.bucket, src.prefix,
+                        dst.bucket, dst.prefix,
+                        key, source_domain, target_domain,
+                    ): key
+                    for key in to_mask
+                }
+                for future in as_completed(futures):
+                    key = futures[future]
+                    try:
+                        _, success, msg = future.result()
+                        if success:
+                            log.info("Masked %s — %s", key, msg)
+                        else:
+                            log.error("Failed %s — %s", key, msg)
+                    except Exception:
+                        log.error("Worker crashed on %s", key, exc_info=True)
+
+                    checkpoint.mark_item_done("mask", key)
+                    checkpoint.save()
+        elif to_mask:
+            # Sequential: used when max_workers <= 1 (or in tests where
+            # moto mock_aws context cannot cross process boundaries).
+            for key in to_mask:
+                log.info("Masking %s", key)
+                table = _download_parquet(src, key)
+                if table is None:
+                    log.warning("Could not read %s, skipping", key)
+                else:
+                    masked = mask_table(table, source_domain, target_domain)
+                    _upload_parquet(dst, key, masked)
+                    log.info("Masked %s — %s rows", key,
+                             f"{table.num_rows:,}")
                 checkpoint.mark_item_done("mask", key)
                 checkpoint.save()
-                continue
-
-            masked = mask_table(table, source_domain, target_domain)
-            _upload_parquet(dst, key, masked)
-
-            checkpoint.mark_item_done("mask", key)
-            checkpoint.save()
 
         checkpoint.complete_phase("mask")
         checkpoint.save(force=True)
@@ -384,7 +453,7 @@ def _upload_parquet(s3: S3Store, key: str, table: pa.Table) -> None:
 # -- CLI -------------------------------------------------------------------- #
 
 def main():
-    from lib.config import load_dotenv, env
+    from lib.config import load_dotenv, env, env_int
     load_dotenv()
 
     parser = argparse.ArgumentParser(
@@ -404,6 +473,9 @@ def main():
     parser.add_argument("--target-domain",
                         default=env("PII_TARGET_DOMAIN", DEFAULT_TARGET_DOMAIN),
                         help=f"Replacement domain (default: {DEFAULT_TARGET_DOMAIN})")
+    parser.add_argument("--max-workers", type=int,
+                        default=env_int("PII_MAX_WORKERS", DEFAULT_WORKERS),
+                        help=f"Parallel workers (default: {DEFAULT_WORKERS})")
     parser.add_argument("--log-level", default=env("LOG_LEVEL", "INFO"))
     parser.add_argument("--no-json-logs", action="store_true")
     parser.add_argument("--log-dir", default=env("LOG_DIR", "logs"))
@@ -429,9 +501,9 @@ def main():
 
     checkpoint.load()
 
-    log.info("Masking BigQuery dataset %s: %s -> %s (domain: %s -> %s)",
+    log.info("Masking BigQuery dataset %s: %s -> %s (domain: %s -> %s, workers: %d)",
              args.dataset, args.src_bucket, args.dst_bucket,
-             args.source_domain, args.target_domain)
+             args.source_domain, args.target_domain, args.max_workers)
 
     mask_bigquery_parquet(
         src=src,
@@ -440,6 +512,7 @@ def main():
         source_domain=args.source_domain,
         target_domain=args.target_domain,
         checkpoint=checkpoint,
+        max_workers=args.max_workers,
     )
 
 
