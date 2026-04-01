@@ -2,7 +2,6 @@
 
 import logging
 
-from scripts.pii_mask.roster import Roster
 from scripts.pii_mask.scanner import TextScanner
 from lib.s3 import S3Store
 
@@ -14,12 +13,14 @@ class BaseMasker:
 
     Subclasses declare which S3 prefix they handle and implement
     ``mask_file`` for per-file masking logic.
+
+    The ``_scan_obj`` method recursively runs ``scanner.scan()`` on
+    every string value — this is the universal safety net.
     """
 
     prefix: str = ""  # S3 prefix, e.g. "github/"
 
-    def __init__(self, roster: Roster, scanner: TextScanner):
-        self.roster = roster
+    def __init__(self, scanner: TextScanner):
         self.scanner = scanner
 
     def list_keys(self, src: S3Store) -> list[str]:
@@ -36,26 +37,20 @@ class BaseMasker:
         raise NotImplementedError
 
     def rewrite_key(self, key: str) -> str:
-        """Rewrite S3 key for destination bucket.
+        """Rewrite S3 key for destination bucket."""
+        return self.scanner.scan_url(key)
 
-        Default: replace real domains with masked domains.
+    def _scan_obj(self, obj):
+        """Recursively run scanner.scan() on every string value.
+
+        Single-pass per string: Presidio detects PII on the original,
+        PIIStore provides consistent replacement, applied at once.
+        No double-replacement risk.
         """
-        result = key
-        for real_domain, fake_domain in self.roster.domain_map.items():
-            result = result.replace(real_domain, fake_domain)
-        return result
-
-    def _replace_domains_in_obj(self, obj):
-        """Recursively replace domains in all string values."""
         if isinstance(obj, str):
-            result = obj
-            for real, fake in self.roster.domain_map.items():
-                result = result.replace(real, fake)
-                # Also handle capitalized variants
-                result = result.replace(real.capitalize(), fake.capitalize())
-            return result
+            return self.scanner.scan(obj) if len(obj) >= 3 else obj
         if isinstance(obj, dict):
-            return {k: self._replace_domains_in_obj(v) for k, v in obj.items()}
+            return {k: self._scan_obj(v) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [self._replace_domains_in_obj(v) for v in obj]
+            return [self._scan_obj(v) for v in obj]
         return obj

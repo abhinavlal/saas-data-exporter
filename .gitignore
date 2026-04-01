@@ -4,8 +4,10 @@
 *.json.key
 service-account.json
 
-# Roster (contains real↔fake identity mapping — sensitive)
+# PII masking artifacts (contain real↔fake identity mappings — sensitive)
 roster.json
+pii_store.db
+smoke_test_report*.json
 
 # Input CSV files (contain real data)
 github_repos.csv

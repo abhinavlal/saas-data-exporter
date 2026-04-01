@@ -1,8 +1,4 @@
-"""Confluence masker — roster-based PII replacement for Confluence exports.
-
-Handles page JSON: author IDs, titles, body HTML/ADF, comments.
-Skips binary attachment files.
-"""
+"""Confluence masker — Presidio-first PII replacement."""
 
 import logging
 
@@ -28,27 +24,26 @@ class ConfluenceMasker(BaseMasker):
         if "/pages/" in key and filename != "_index.json":
             data = self._mask_page(data)
         elif filename in ("_stats.json", "_index.json"):
-            pass  # no PII
+            pass
         else:
-            return "skipped (unknown type)"
+            data = self._scan_obj(data)
 
-        data = self._replace_domains_in_obj(data)
         dst.upload_json(data, key)
         return "ok"
 
     def _mask_page(self, page: dict) -> dict:
         if page.get("author_id"):
-            page["author_id"] = self.roster.map_jira_account_id(
-                page["author_id"])
+            page["author_id"] = self.scanner.scan_structured(
+                "JIRA_ACCOUNT_ID", page["author_id"])
 
-        # Freeform text: scan, preserving readability
+        # Title and body: full Presidio scan
         page["title"] = self.scanner.scan(page.get("title", ""))
         page["body"] = self.scanner.scan(page.get("body", ""))
 
         for comment in page.get("comments", []):
             if comment.get("author_id"):
-                comment["author_id"] = self.roster.map_jira_account_id(
-                    comment["author_id"])
+                comment["author_id"] = self.scanner.scan_structured(
+                    "JIRA_ACCOUNT_ID", comment["author_id"])
             comment["body"] = self.scanner.scan(comment.get("body", ""))
 
         return page

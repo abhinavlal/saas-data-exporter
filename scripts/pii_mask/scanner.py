@@ -1,233 +1,248 @@
-"""TextScanner — Aho-Corasick multi-pattern text replacement.
+"""TextScanner — Presidio-first PII detection with single-pass replacement.
 
-Builds an automaton from all roster-derived search terms and scans
-freeform text fields in a single O(n) pass, replacing all matches
-with the corresponding fake values from the roster.
+Detects PII on the ORIGINAL text using Presidio, looks up consistent
+replacements from PIIStore (auto-generating fakes for new entities),
+then applies all replacements in a single right-to-left pass.
 
-Also provides regex-based fallback for structural PII (emails, phone
-numbers) that aren't in the roster.
+Never scans already-replaced output — no double-replacement risk.
+
+Includes custom recognizers for Indian PII types (PAN, Aadhaar, UPI,
+IFSC, bank account numbers) not covered by Presidio's defaults.
 """
 
 import logging
 import re
 
-import ahocorasick
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
 
-from scripts.pii_mask.roster import Roster
+from scripts.pii_mask.pii_store import PIIStore
 
 log = logging.getLogger(__name__)
 
-# Minimum length for email local-part terms (avoids false positives)
-_MIN_LOCAL_PART_LEN = 6
+# -- Entity types --------------------------------------------------------- #
 
-# Regex patterns for structural PII not in the roster
-_EMAIL_RE = re.compile(
-    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}\b")
-_PHONE_IN_RE = re.compile(r"\b[6-9]\d{9}\b")
-_PHONE_INTL_RE = re.compile(r"\+\d{1,3}[\s-]?\d{6,14}\b")
+# Built-in Presidio entities
+_BUILTIN_ENTITIES = [
+    "PERSON",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "LOCATION",
+    "CREDIT_CARD",
+    "IP_ADDRESS",
+    "US_SSN",
+    "IBAN_CODE",
+    "URL",
+    "MEDICAL_LICENSE",
+]
 
+# Custom entities (Indian PII + financial)
+_CUSTOM_ENTITIES = [
+    "IN_PAN",
+    "IN_AADHAAR",
+    "IN_UPI_ID",
+    "IN_IFSC",
+    "IN_BANK_ACCOUNT",
+    "GEO_COORDINATE",
+]
+
+_ALL_ENTITIES = _BUILTIN_ENTITIES + _CUSTOM_ENTITIES
+
+DEFAULT_THRESHOLD = 0.5
+
+
+# -- Custom recognizers ---------------------------------------------------- #
+
+def _build_custom_recognizers() -> list[PatternRecognizer]:
+    """Build regex-based recognizers for Indian PII types."""
+
+    recognizers = []
+
+    # Indian PAN: 5 uppercase letters + 4 digits + 1 uppercase letter
+    # e.g. ABCPD1234E
+    recognizers.append(PatternRecognizer(
+        supported_entity="IN_PAN",
+        name="IndianPANRecognizer",
+        patterns=[Pattern(
+            name="in_pan",
+            regex=r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",
+            score=0.7,
+        )],
+        supported_language="en",
+    ))
+
+    # Indian Aadhaar: 12 digits starting with 2-9, optionally spaced as 4-4-4
+    # e.g. 2345 6789 0123 or 234567890123
+    recognizers.append(PatternRecognizer(
+        supported_entity="IN_AADHAAR",
+        name="IndianAadhaarRecognizer",
+        patterns=[Pattern(
+            name="in_aadhaar",
+            regex=r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b",
+            score=0.6,
+        )],
+        supported_language="en",
+    ))
+
+    # UPI ID: identifier@bankhandle
+    # e.g. john@okaxis, 9876543210@paytm, user.name@ybl
+    _UPI_HANDLES = (
+        "okaxis|oksbi|okicici|okhdfcbank|okkotak"
+        "|ybl|paytm|upi|apl|ibl|axisbank"
+        "|sbi|icici|hdfcbank|kotak|indus|citi"
+        "|boi|pnb|unionbank|canara|bob"
+        "|airtel|jio|freecharge|phonepe|gpay"
+    )
+    recognizers.append(PatternRecognizer(
+        supported_entity="IN_UPI_ID",
+        name="IndianUPIRecognizer",
+        patterns=[Pattern(
+            name="in_upi_id",
+            regex=rf"\b[a-zA-Z0-9._-]+@(?:{_UPI_HANDLES})\b",
+            score=0.8,
+        )],
+        supported_language="en",
+    ))
+
+    # IFSC Code: 4 uppercase letters + 0 + 6 alphanumeric
+    # e.g. SBIN0001234, HDFC0001234
+    recognizers.append(PatternRecognizer(
+        supported_entity="IN_IFSC",
+        name="IndianIFSCRecognizer",
+        patterns=[Pattern(
+            name="in_ifsc",
+            regex=r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
+            score=0.7,
+        )],
+        supported_language="en",
+    ))
+
+    # Indian bank account number: 9-18 digits (with context keywords)
+    # High false-positive risk without context, so require a keyword nearby
+    recognizers.append(PatternRecognizer(
+        supported_entity="IN_BANK_ACCOUNT",
+        name="IndianBankAccountRecognizer",
+        patterns=[Pattern(
+            name="in_bank_account",
+            regex=r"(?i)(?:account|a/c|acct)[^\d]{0,10}(\d{9,18})\b",
+            score=0.5,
+        )],
+        supported_language="en",
+    ))
+
+    # Geo coordinates: latitude,longitude pairs
+    # e.g. 12.9716,77.5946 or 28.6139, 77.2090
+    recognizers.append(PatternRecognizer(
+        supported_entity="GEO_COORDINATE",
+        name="GeoCoordinateRecognizer",
+        patterns=[Pattern(
+            name="geo_latlon",
+            regex=r"\b-?\d{1,3}\.\d{4,},\s?-?\d{1,3}\.\d{4,}\b",
+            score=0.6,
+        )],
+        supported_language="en",
+    ))
+
+    return recognizers
+
+
+# -- Scanner --------------------------------------------------------------- #
 
 class TextScanner:
-    """Aho-Corasick text scanner backed by a roster.
+    """Presidio-first PII scanner with PIIStore-backed replacement.
 
-    Build once, call ``scan()`` on every freeform text field.
-    Thread-safe after construction (the automaton is read-only).
+    Build once, call ``scan()`` on every text field.
+    Thread-safe — AnalyzerEngine and PIIStore are both thread-safe.
     """
 
-    def __init__(self, roster: Roster, ner_engine=None):
-        self._roster = roster
-        self._ner = ner_engine  # Optional NEREngine for second-pass detection
-        self._automaton = ahocorasick.Automaton()
+    def __init__(self, store: PIIStore,
+                 threshold: float = DEFAULT_THRESHOLD):
+        self._store = store
+        self._threshold = threshold
 
-        # Track which patterns we've added (for dedup)
-        added: set[str] = set()
-        term_count = 0
+        log.info("Initializing Presidio analyzer with custom recognizers...")
+        self._analyzer = AnalyzerEngine()
 
-        for entry in roster.users:
-            real = entry.real
-            masked = entry.masked
+        # Register custom recognizers for Indian PII types
+        for recognizer in _build_custom_recognizers():
+            self._analyzer.registry.add_recognizer(recognizer)
+            log.info("  Registered: %s → %s",
+                     recognizer.name, recognizer.supported_entities)
 
-            # Full name (case-sensitive)
-            if real.get("name") and masked.get("name"):
-                term_count += self._add_term(
-                    real["name"], masked["name"], added, case_sensitive=True)
-
-            # Email (case-insensitive — stored lowercased)
-            if real.get("email") and masked.get("email"):
-                term_count += self._add_term(
-                    real["email"].lower(), masked["email"],
-                    added, case_sensitive=False)
-
-            # GitHub login preceded by @ (case-insensitive)
-            if real.get("github_login") and masked.get("github_login"):
-                real_at = f"@{real['github_login'].lower()}"
-                masked_at = f"@{masked['github_login']}"
-                term_count += self._add_term(
-                    real_at, masked_at, added, case_sensitive=False)
-
-            # Slack mention syntax: <@U01ABC123>
-            if real.get("slack_user_id") and masked.get("slack_user_id"):
-                real_mention = f"<@{real['slack_user_id']}>"
-                masked_mention = f"<@{masked['slack_user_id']}>"
-                term_count += self._add_term(
-                    real_mention, masked_mention, added, case_sensitive=True)
-
-            # Email local part (case-insensitive, min length to avoid false positives)
-            if real.get("email") and masked.get("email"):
-                local = real["email"].split("@")[0].lower()
-                masked_local = masked["email"].split("@")[0]
-                if len(local) >= _MIN_LOCAL_PART_LEN:
-                    term_count += self._add_term(
-                        local, masked_local, added, case_sensitive=False)
-
-            # First + last name separately (only if >= 5 chars)
-            if real.get("first_name") and masked.get("first_name"):
-                if len(real["first_name"]) >= 5:
-                    term_count += self._add_term(
-                        real["first_name"], masked["first_name"],
-                        added, case_sensitive=True)
-            if real.get("last_name") and masked.get("last_name"):
-                if len(real["last_name"]) >= 5:
-                    term_count += self._add_term(
-                        real["last_name"], masked["last_name"],
-                        added, case_sensitive=True)
-
-        if term_count > 0:
-            self._automaton.make_automaton()
-        self._has_automaton = term_count > 0
-
-        # Build set of masked values so regex/NER don't re-process them
-        self._masked_emails: set[str] = set()
-        self._ner_allow_list: list[str] = []
-        for entry in roster.users:
-            masked = entry.masked
-            if masked.get("email"):
-                self._masked_emails.add(masked["email"].lower())
-            # Populate NER allow list with all masked values
-            for val in masked.values():
-                if isinstance(val, str) and len(val) >= 3:
-                    self._ner_allow_list.append(val)
-
-        log.info("TextScanner built: %d search terms from %d roster entries"
-                 " (NER: %s)",
-                 term_count, len(roster.users),
-                 "enabled" if self._ner else "disabled")
-
-    def _add_term(self, pattern: str, replacement: str,
-                  seen: set, case_sensitive: bool) -> int:
-        """Add a search term to the automaton. Returns 1 if added, 0 if dup.
-
-        The automaton always stores lowercased keys so we can search
-        against lowered text.  For case-sensitive terms, the original
-        pattern is kept for post-match verification.
-        """
-        key = pattern.lower()
-        if not key or key in seen:
-            return 0
-        seen.add(key)
-        # Store (replacement, original_pattern, case_sensitive)
-        self._automaton.add_word(key, (replacement, pattern, case_sensitive))
-        return 1
+        log.info("TextScanner ready (threshold=%.2f, entities=%d)",
+                 threshold, len(_ALL_ENTITIES))
 
     # -- Public API -------------------------------------------------------- #
 
-    def scan(self, text: str) -> str:
-        """Replace all roster-known PII in freeform text.
+    def scan(self, text: str, source: str = "") -> str:
+        """Detect PII on original text, replace in single pass.
 
-        Three-pass pipeline:
-        1. Aho-Corasick: O(n) multi-pattern matching for roster identities
-        2. Regex: structural PII (emails, phones) not in the roster
-        3. NER (optional): Presidio-based detection of remaining PII
+        1. Presidio detects PII spans on the original text
+        2. Each span → PIIStore lookup (consistent) or auto-generate
+        3. All replacements applied right-to-left (no re-scan)
         """
-        if not text:
+        if not text or len(text) < 3:
             return text
 
-        # Phase 1: Aho-Corasick scan
-        if self._has_automaton:
-            text = self._ac_replace(text)
+        try:
+            results = self._analyzer.analyze(
+                text=text,
+                language="en",
+                entities=_ALL_ENTITIES,
+                score_threshold=self._threshold,
+            )
+        except Exception:
+            log.debug("Presidio analysis failed, falling back to domain-only",
+                      exc_info=True)
+            return self._domain_replace(text)
 
-        # Phase 2: Regex fallback for structural PII not caught by AC
-        text = self._regex_fallback(text)
+        if not results:
+            return self._domain_replace(text)
 
-        # Phase 3: NER (optional) — catches PII not in roster or regex
-        if self._ner is not None:
-            text = self._ner.mask(text, allow_list=self._ner_allow_list)
+        # Sort by start position, longest match first
+        results.sort(key=lambda r: (r.start, -(r.end - r.start)))
 
-        return text
+        # Resolve overlaps: greedy left-to-right, longest wins
+        resolved = []
+        last_end = 0
+        for r in results:
+            if r.start >= last_end:
+                real_value = text[r.start:r.end]
+                fake_value = self._store.get_or_create(
+                    r.entity_type, real_value, source=source)
+                resolved.append((r.start, r.end, fake_value))
+                last_end = r.end
 
-    def scan_email(self, email: str) -> str:
-        """Map an email using the roster, with hash fallback."""
-        return self._roster.map_email(email)
+        # Apply replacements right-to-left (preserves character offsets)
+        chars = list(text)
+        for start, end, replacement in reversed(resolved):
+            chars[start:end] = list(replacement)
+        result = "".join(chars)
+
+        return self._domain_replace(result)
+
+    def scan_structured(self, entity_type: str, value: str,
+                        source: str = "") -> str:
+        """Direct PIIStore lookup for known-type fields.
+
+        Use this for fields where we KNOW the entity type (e.g., an
+        email field, a username field). Skips Presidio NER — faster.
+        """
+        if not value:
+            return value
+        return self._store.get_or_create(entity_type, value, source=source)
 
     def scan_url(self, url: str) -> str:
-        """Replace domains in a URL using the roster's domain_map."""
+        """Replace domains in a URL using the store's domain_map."""
         if not url:
             return url
-        for real_domain, fake_domain in self._roster.domain_map.items():
-            url = url.replace(real_domain, fake_domain)
-        return url
+        return self._domain_replace(url)
 
     # -- Internal ---------------------------------------------------------- #
 
-    def _ac_replace(self, text: str) -> str:
-        """Run the Aho-Corasick automaton and apply replacements.
-
-        Collects all matches, resolves overlaps (longest match wins),
-        then applies replacements right-to-left to preserve offsets.
-        """
-        text_lower = text.lower()
-
-        # Collect all matches: (start, end, replacement, case_sensitive)
-        matches = []
-        for end_idx, (replacement, pattern, case_sensitive) in \
-                self._automaton.iter(text_lower):
-            start_idx = end_idx - len(pattern) + 1
-
-            if case_sensitive:
-                # Verify the original text matches case-sensitively
-                original_span = text[start_idx:end_idx + 1]
-                if original_span != pattern:
-                    continue
-
-            matches.append((start_idx, end_idx + 1, replacement))
-
-        if not matches:
-            return text
-
-        # Sort by start position, then by length descending (longest first)
-        matches.sort(key=lambda m: (m[0], -(m[1] - m[0])))
-
-        # Resolve overlaps: greedy left-to-right, longest match wins
-        resolved = []
-        last_end = 0
-        for start, end, replacement in matches:
-            if start >= last_end:
-                resolved.append((start, end, replacement))
-                last_end = end
-
-        # Apply replacements right-to-left
-        result = list(text)
-        for start, end, replacement in reversed(resolved):
-            result[start:end] = list(replacement)
-
-        return "".join(result)
-
-    def _regex_fallback(self, text: str) -> str:
-        """Replace structural PII (emails, phones) not caught by AC."""
-        if not text:
-            return text
-
-        # Emails: replace with roster-mapped version (skip already-masked)
-        def _replace_email(m):
-            email = m.group(0)
-            if email.lower() in self._masked_emails:
-                return email  # already replaced by AC
-            return self._roster.map_email(email)
-
-        text = _EMAIL_RE.sub(_replace_email, text)
-
-        # Phone numbers: redact
-        text = _PHONE_IN_RE.sub("[PHONE]", text)
-        text = _PHONE_INTL_RE.sub("[PHONE]", text)
-
+    def _domain_replace(self, text: str) -> str:
+        """Replace all known domains in text."""
+        for real_domain, fake_domain in self._store.domain_map.items():
+            text = text.replace(real_domain, fake_domain)
+            text = text.replace(
+                real_domain.capitalize(), fake_domain.capitalize())
         return text

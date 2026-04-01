@@ -1,80 +1,100 @@
-"""EML masker — RFC 822 email parsing and PII replacement.
+"""EML masker — full RFC 822 email PII replacement.
 
-Parses raw .eml bytes, masks structured headers (From, To, CC, BCC,
-Subject) and text/HTML body parts using the roster + scanner.
-Binary MIME attachments are left untouched.
+Scans ALL headers and body parts using the Presidio-powered scanner.
+No header is skipped — Delivered-To, Return-Path, Received, DKIM,
+Authentication-Results, etc. all get domain + PII replacement.
 """
 
 import email
 import email.utils
 import email.policy
 import logging
-import re
 from email.message import EmailMessage
 
-from scripts.pii_mask.roster import Roster
 from scripts.pii_mask.scanner import TextScanner
 
 log = logging.getLogger(__name__)
 
-# Headers that contain email addresses
-_ADDRESS_HEADERS = ("from", "to", "cc", "bcc", "reply-to")
+# Headers that contain parseable email addresses
+_ADDRESS_HEADERS = frozenset({
+    "from", "to", "cc", "bcc", "reply-to", "sender",
+    "delivered-to", "return-path", "x-original-to",
+    "x-forwarded-to", "envelope-to",
+})
 
-# Headers that contain freeform text
-_TEXT_HEADERS = ("subject",)
+# Headers to skip entirely (binary/structural, no PII)
+_SKIP_HEADERS = frozenset({
+    "content-type", "content-transfer-encoding", "content-disposition",
+    "mime-version", "content-id", "content-length",
+})
 
 
-def mask_eml(eml_bytes: bytes, roster: Roster,
-             scanner: TextScanner) -> bytes:
-    """Parse, mask, and re-encode an EML file.
+def mask_eml(eml_bytes: bytes, scanner: TextScanner) -> bytes:
+    """Parse, mask all headers + body, re-encode.
 
-    Returns the masked email as bytes, preserving MIME structure.
+    Every header is processed:
+    - Address headers: parse + replace each email/name via scanner
+    - All other headers: run scanner.scan() to catch PII + domains
+    - Body text/html parts: full scanner.scan()
+    - Final: domain sweep on raw bytes for DKIM/Received leftovers
     """
     msg = email.message_from_bytes(eml_bytes, policy=email.policy.default)
 
-    # -- Mask address headers --
-    for hdr_name in _ADDRESS_HEADERS:
-        if msg[hdr_name]:
-            original = msg[hdr_name]
-            masked = _mask_address_header(original, roster, scanner)
-            if masked != original:
-                del msg[hdr_name]
-                msg[hdr_name] = masked
+    # -- Mask ALL headers --
+    for hdr_name in list(msg.keys()):
+        hdr_lower = hdr_name.lower()
 
-    # -- Mask text headers --
-    for hdr_name in _TEXT_HEADERS:
-        if msg[hdr_name]:
-            original = msg[hdr_name]
+        if hdr_lower in _SKIP_HEADERS:
+            continue
+
+        original = str(msg[hdr_name])
+
+        if hdr_lower in _ADDRESS_HEADERS:
+            masked = _mask_address_header(original, scanner)
+        else:
+            # All other headers: Presidio scan catches PII + domain sweep
             masked = scanner.scan(original)
-            if masked != original:
-                del msg[hdr_name]
-                msg[hdr_name] = masked
+
+        if masked != original:
+            del msg[hdr_name]
+            msg[hdr_name] = masked
 
     # -- Mask body parts --
     if msg.is_multipart():
-        _mask_parts(msg, scanner)
+        for part in msg.walk():
+            _mask_body_part(part, scanner)
     else:
-        _mask_single_part(msg, scanner)
+        _mask_body_part(msg, scanner)
 
-    return msg.as_bytes()
+    # Convert back to bytes
+    masked_bytes = msg.as_bytes()
+
+    # Final domain sweep on raw bytes — catches domains in DKIM signatures,
+    # Received headers, and other places the parser might not expose
+    for real_domain, fake_domain in scanner._store.domain_map.items():
+        masked_bytes = masked_bytes.replace(
+            real_domain.encode(), fake_domain.encode())
+
+    return masked_bytes
 
 
-def _mask_address_header(header_value: str, roster: Roster,
+def _mask_address_header(header_value: str,
                          scanner: TextScanner) -> str:
-    """Mask email addresses and display names in an address header.
-
-    Handles comma-separated lists: "John Doe <john@org.com>, Jane <jane@org.com>"
-    """
+    """Parse email addresses from a header and replace via scanner."""
     addresses = email.utils.getaddresses([header_value])
+    if not addresses or all(not addr for _, addr in addresses):
+        # Not parseable as addresses — scan as plain text instead
+        return scanner.scan(header_value)
+
     masked_parts = []
     for display_name, addr in addresses:
         if addr:
-            masked_addr = scanner.scan_email(addr)
+            masked_addr = scanner.scan_structured("EMAIL_ADDRESS", addr)
         else:
             masked_addr = addr
 
         if display_name:
-            masked_name = roster.map_name(display_name)
+            masked_name = scanner.scan_structured("PERSON", display_name)
         else:
             masked_name = display_name
 
@@ -84,16 +104,8 @@ def _mask_address_header(header_value: str, roster: Roster,
     return ", ".join(masked_parts)
 
 
-def _mask_parts(msg: EmailMessage, scanner: TextScanner) -> None:
-    """Walk multipart MIME and mask text/* parts."""
-    for part in msg.walk():
-        content_type = part.get_content_type()
-        if content_type in ("text/plain", "text/html"):
-            _mask_single_part(part, scanner)
-
-
-def _mask_single_part(part: EmailMessage, scanner: TextScanner) -> None:
-    """Mask the text content of a single MIME part."""
+def _mask_body_part(part: EmailMessage, scanner: TextScanner) -> None:
+    """Scan a single MIME part's text content with Presidio."""
     content_type = part.get_content_type()
     if content_type not in ("text/plain", "text/html"):
         return
@@ -101,7 +113,6 @@ def _mask_single_part(part: EmailMessage, scanner: TextScanner) -> None:
     try:
         text = part.get_content()
     except (KeyError, LookupError):
-        # Can't decode — leave untouched
         return
 
     if not isinstance(text, str):

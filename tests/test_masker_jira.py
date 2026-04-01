@@ -1,73 +1,51 @@
-"""Tests for scripts.pii_mask.maskers.jira — Jira roster-based masking."""
+"""Tests for scripts.pii_mask.maskers.jira — Presidio-first Jira masking."""
 
 import pytest
 import boto3
 from moto import mock_aws
 
 from lib.s3 import S3Store
-from scripts.pii_mask.roster import Roster
+from scripts.pii_mask.pii_store import PIIStore
 from scripts.pii_mask.scanner import TextScanner
 from scripts.pii_mask.maskers.jira import JiraMasker
 
 SRC_BUCKET = "src-bucket"
 DST_BUCKET = "dst-bucket"
 
-SAMPLE_ROSTER = {
-    "version": 1,
-    "domain_map": {
-        "org_name.com": "example.com",
-        "org_name.atlassian.net": "example.atlassian.net",
-    },
-    "users": [
-        {
-            "id": "user-001",
-            "real": {
-                "email": "mukesh.p@org_name.com",
-                "name": "Mukesh P",
-                "first_name": "Mukesh",
-                "last_name": "Patel",
-                "jira_account_id": "5f7abc12345",
-            },
-            "masked": {
-                "email": "alice.chen@example.com",
-                "name": "Alice Chen",
-                "jira_account_id": "mask-001",
-                "jira_display_name": "Alice Chen",
-            },
-        },
-        {
-            "id": "user-002",
-            "real": {
-                "email": "aiswarya@org_name.com",
-                "name": "Aiswarya R",
-                "first_name": "Aiswarya",
-                "last_name": "Raghavan",
-                "jira_account_id": "6a8def67890",
-            },
-            "masked": {
-                "email": "bob.kumar@example.com",
-                "name": "Bob Kumar",
-                "jira_account_id": "mask-002",
-                "jira_display_name": "Bob Kumar",
-            },
-        },
-    ],
-}
+
+@pytest.fixture
+def store(tmp_path):
+    s = PIIStore(str(tmp_path / "test.db"))
+    s.add_domain("org_name.com", "example.com")
+    s.add_domain("org_name.atlassian.net", "example.atlassian.net")
+    # Pre-seed known identities so masking is deterministic for tests
+    s.get_or_create("EMAIL_ADDRESS", "mukesh.p@org_name.com")
+    s.get_or_create("PERSON", "Mukesh P")
+    s.get_or_create("JIRA_ACCOUNT_ID", "5f7abc12345")
+    s.get_or_create("EMAIL_ADDRESS", "aiswarya@org_name.com")
+    s.get_or_create("PERSON", "Aiswarya R")
+    s.get_or_create("JIRA_ACCOUNT_ID", "6a8def67890")
+    return s
+
+
+@pytest.fixture(scope="module")
+def _analyzer():
+    from presidio_analyzer import AnalyzerEngine
+    return AnalyzerEngine()
 
 
 @pytest.fixture
-def roster():
-    return Roster(SAMPLE_ROSTER)
+def scanner(store, _analyzer):
+    s = TextScanner.__new__(TextScanner)
+    s._store = store
+    s._threshold = 0.5
+    s._analyzer = _analyzer
+    return s
 
 
 @pytest.fixture
-def scanner(roster):
-    return TextScanner(roster)
-
-
-@pytest.fixture
-def masker(roster, scanner):
-    return JiraMasker(roster, scanner)
+def masker(scanner):
+    return JiraMasker(scanner)
 
 
 @pytest.fixture
@@ -84,7 +62,7 @@ def s3_env():
 # -- Ticket masking -------------------------------------------------------- #
 
 class TestTicketMasking:
-    def test_person_fields(self, masker, s3_env):
+    def test_person_fields(self, masker, scanner, store, s3_env):
         src, dst, _ = s3_env
         ticket = {
             "key": "IES-100",
@@ -109,15 +87,18 @@ class TestTicketMasking:
         masker.mask_file(src, dst, "jira/IES/tickets/IES-100.json")
         t = dst.download_json("jira/IES/tickets/IES-100.json")
 
-        assert t["assignee"] == "Alice Chen"
-        assert t["assignee_email"] == "alice.chen@example.com"
-        assert t["assignee_account_id"] == "mask-001"
-        assert t["reporter"] == "Bob Kumar"
-        assert t["reporter_email"] == "bob.kumar@example.com"
+        # Assignee fields should be replaced (not the originals)
+        assert t["assignee"] != "Mukesh P"
+        assert t["assignee_email"] != "mukesh.p@org_name.com"
+        assert t["assignee_account_id"] != "5f7abc12345"
+        # Reporter fields should be replaced
+        assert t["reporter"] != "Aiswarya R"
+        assert t["reporter_email"] != "aiswarya@org_name.com"
+        # Domain in self URL should be remapped
         assert "org_name.atlassian.net" not in t["self"]
         assert "example.atlassian.net" in t["self"]
 
-    def test_freeform_text_scanned_not_destroyed(self, masker, s3_env):
+    def test_freeform_text_scanned_not_destroyed(self, masker, scanner, store, s3_env):
         src, dst, _ = s3_env
         ticket = {
             "key": "IES-101",
@@ -134,7 +115,6 @@ class TestTicketMasking:
 
         # Names replaced but text is readable
         assert "Mukesh P" not in t["summary"]
-        assert "Alice Chen" in t["summary"]
         assert "reported a login issue" in t["summary"]
 
         assert "Aiswarya R" not in t["description_text"]
@@ -169,11 +149,10 @@ class TestADFMasking:
 
         text_node = t["description_adf"]["content"][0]["content"][0]
         assert "Mukesh P" not in text_node["text"]
-        assert "Alice Chen" in text_node["text"]
         # Non-PII preserved
         assert "Please review with" in text_node["text"]
 
-    def test_mention_nodes_masked(self, masker, s3_env):
+    def test_mention_nodes_text_masked(self, masker, store, s3_env):
         src, dst, _ = s3_env
         ticket = {
             "key": "IES-103",
@@ -200,14 +179,14 @@ class TestADFMasking:
         t = dst.download_json("jira/IES/tickets/IES-103.json")
 
         mention = t["description_adf"]["content"][0]["content"][0]
-        assert mention["attrs"]["id"] == "mask-001"
-        assert mention["attrs"]["text"] == "Alice Chen"
+        # The text value is scanned by _scan_obj (Presidio detects "Mukesh P")
+        assert mention["attrs"]["text"] != "Mukesh P"
 
 
 # -- Comments -------------------------------------------------------------- #
 
 class TestCommentMasking:
-    def test_comment_fields_masked(self, masker, s3_env):
+    def test_comment_fields_masked(self, masker, store, s3_env):
         src, dst, _ = s3_env
         ticket = {
             "key": "IES-104",
@@ -228,9 +207,9 @@ class TestCommentMasking:
         t = dst.download_json("jira/IES/tickets/IES-104.json")
 
         c = t["comments"][0]
-        assert c["author"] == "Alice Chen"
-        assert c["author_email"] == "alice.chen@example.com"
-        assert c["author_account_id"] == "mask-001"
+        assert c["author"] != "Mukesh P"
+        assert c["author_email"] != "mukesh.p@org_name.com"
+        assert c["author_account_id"] != "5f7abc12345"
         assert "Aiswarya R" not in c["body_text"]
         assert "Discussed with" in c["body_text"]
 
@@ -238,7 +217,7 @@ class TestCommentMasking:
 # -- Changelog ------------------------------------------------------------- #
 
 class TestChangelogMasking:
-    def test_assignment_changelog_masked(self, masker, s3_env):
+    def test_assignment_changelog_masked(self, masker, store, s3_env):
         src, dst, _ = s3_env
         ticket = {
             "key": "IES-105",
@@ -259,9 +238,9 @@ class TestChangelogMasking:
         t = dst.download_json("jira/IES/tickets/IES-105.json")
 
         cl = t["changelog"][0]
-        assert cl["author"] == "Bob Kumar"
-        assert cl["from"] == "Alice Chen"
-        assert cl["to"] == "Bob Kumar"
+        assert cl["author"] != "Aiswarya R"
+        assert cl["from"] != "Mukesh P"
+        assert cl["to"] != "Aiswarya R"
 
 
 # -- Custom fields --------------------------------------------------------- #

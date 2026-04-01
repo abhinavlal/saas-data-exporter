@@ -15,7 +15,6 @@ import duckdb
 
 from lib.s3 import S3Store
 from scripts.pii_mask.maskers.base import BaseMasker
-from scripts.pii_mask.roster import Roster
 from scripts.pii_mask.scanner import TextScanner
 
 # Import the SQL expression builders from the deprecated module
@@ -46,13 +45,13 @@ class BigQueryMasker(BaseMasker):
 
     prefix = "bigquery/"
 
-    def __init__(self, roster: Roster, scanner: TextScanner,
+    def __init__(self, scanner: TextScanner,
                  dataset: str = "",
                  source_domain: str = DEFAULT_SOURCE_DOMAIN,
                  target_domain: str = DEFAULT_TARGET_DOMAIN,
                  s3_region: str | None = None,
                  use_httpfs: bool = True):
-        super().__init__(roster, scanner)
+        super().__init__(scanner)
         self.dataset = dataset
         self.source_domain = source_domain
         self.target_domain = target_domain

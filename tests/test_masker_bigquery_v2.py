@@ -8,18 +8,34 @@ import pyarrow.parquet as pq
 from moto import mock_aws
 
 from lib.s3 import S3Store
-from scripts.pii_mask.roster import Roster
+from scripts.pii_mask.pii_store import PIIStore
 from scripts.pii_mask.scanner import TextScanner
 from scripts.pii_mask.maskers.bigquery import BigQueryMasker
 
 SRC_BUCKET = "src-bucket"
 DST_BUCKET = "dst-bucket"
 
-SAMPLE_ROSTER = {
-    "version": 1,
-    "domain_map": {"org_name.com": "example.com"},
-    "users": [],
-}
+
+@pytest.fixture
+def store(tmp_path):
+    s = PIIStore(str(tmp_path / "test.db"))
+    s.add_domain("org_name.com", "example.com")
+    return s
+
+
+@pytest.fixture(scope="module")
+def _analyzer():
+    from presidio_analyzer import AnalyzerEngine
+    return AnalyzerEngine()
+
+
+@pytest.fixture
+def scanner(store, _analyzer):
+    s = TextScanner.__new__(TextScanner)
+    s._store = store
+    s._threshold = 0.5
+    s._analyzer = _analyzer
+    return s
 
 
 @pytest.fixture
@@ -46,12 +62,10 @@ def _download_parquet_s3(conn, bucket, key) -> pa.Table:
 
 
 class TestBigQueryMasker:
-    def test_masks_parquet_via_pipeline_interface(self, s3_env):
+    def test_masks_parquet_via_pipeline_interface(self, scanner, s3_env):
         src, dst, conn = s3_env
-        roster = Roster(SAMPLE_ROSTER)
-        scanner = TextScanner(roster)
         masker = BigQueryMasker(
-            roster, scanner,
+            scanner,
             dataset="analytics_123",
             source_domain="org_name.com",
             target_domain="example-health.com",
@@ -83,11 +97,9 @@ class TestBigQueryMasker:
         uids = out.column("user_pseudo_id").to_pylist()
         assert uids[0] != "abc123"
 
-    def test_list_keys_filters_parquet(self, s3_env):
+    def test_list_keys_filters_parquet(self, scanner, s3_env):
         src, dst, conn = s3_env
-        roster = Roster(SAMPLE_ROSTER)
-        scanner = TextScanner(roster)
-        masker = BigQueryMasker(roster, scanner, dataset="ds1",
+        masker = BigQueryMasker(scanner, dataset="ds1",
                                 use_httpfs=False)
 
         table = pa.table({"x": [1]})
@@ -99,9 +111,7 @@ class TestBigQueryMasker:
         assert "bigquery/ds1/events/day1.parquet" in keys
         assert "bigquery/ds1/_stats.json" not in keys
 
-    def test_should_process(self):
-        roster = Roster(SAMPLE_ROSTER)
-        scanner = TextScanner(roster)
-        masker = BigQueryMasker(roster, scanner)
+    def test_should_process(self, scanner):
+        masker = BigQueryMasker(scanner)
         assert masker.should_process("bigquery/ds/events/f.parquet")
         assert not masker.should_process("bigquery/ds/_stats.json")

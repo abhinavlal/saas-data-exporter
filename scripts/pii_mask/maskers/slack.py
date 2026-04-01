@@ -1,20 +1,11 @@
-"""Slack masker — roster-based PII replacement for Slack exports.
-
-Handles message JSON and channel info. Replaces user IDs, mention
-syntax (<@U01ABC123>), reaction user IDs, and scans freeform message
-text for PII.
-"""
+"""Slack masker — Presidio-first PII replacement."""
 
 import logging
-import re
 
 from lib.s3 import S3Store
 from scripts.pii_mask.maskers.base import BaseMasker
 
 log = logging.getLogger(__name__)
-
-# Slack mention pattern: <@U01ABC123>
-_SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)>")
 
 
 class SlackMasker(BaseMasker):
@@ -37,54 +28,37 @@ class SlackMasker(BaseMasker):
         elif filename in ("_stats.json", "_index.json"):
             pass
         else:
-            return "skipped (unknown type)"
+            data = self._scan_obj(data)
 
-        data = self._replace_domains_in_obj(data)
         dst.upload_json(data, key)
         return "ok"
 
     def _mask_message(self, msg: dict) -> dict:
-        # User ID
         if msg.get("user"):
-            msg["user"] = self.roster.map_slack_user_id(msg["user"])
+            msg["user"] = self.scanner.scan_structured(
+                "SLACK_USER_ID", msg["user"])
 
-        # Message text: scan for PII + replace <@UID> mentions
+        # Message text: full Presidio scan
         if msg.get("text"):
             msg["text"] = self.scanner.scan(msg["text"])
 
-        # Reactions: replace user IDs
         for reaction in msg.get("reactions", []):
             reaction["users"] = [
-                self.roster.map_slack_user_id(u)
-                for u in reaction.get("users", [])
-            ]
+                self.scanner.scan_structured("SLACK_USER_ID", u)
+                for u in reaction.get("users", [])]
 
-        # Thread replies
         for reply in msg.get("replies", []):
             if reply.get("user"):
-                reply["user"] = self.roster.map_slack_user_id(reply["user"])
+                reply["user"] = self.scanner.scan_structured(
+                    "SLACK_USER_ID", reply["user"])
 
-        # File attachments metadata
         for f in msg.get("files", []):
             if f.get("user"):
-                f["user"] = self.roster.map_slack_user_id(f["user"])
+                f["user"] = self.scanner.scan_structured(
+                    "SLACK_USER_ID", f["user"])
 
         return msg
 
     def _mask_channel_info(self, info: dict) -> dict:
-        if info.get("creator"):
-            info["creator"] = self.roster.map_slack_user_id(info["creator"])
-        if info.get("topic", {}).get("creator"):
-            info["topic"]["creator"] = self.roster.map_slack_user_id(
-                info["topic"]["creator"])
-        if info.get("purpose", {}).get("creator"):
-            info["purpose"]["creator"] = self.roster.map_slack_user_id(
-                info["purpose"]["creator"])
-        # Scan topic/purpose text
-        if info.get("topic", {}).get("value"):
-            info["topic"]["value"] = self.scanner.scan(
-                info["topic"]["value"])
-        if info.get("purpose", {}).get("value"):
-            info["purpose"]["value"] = self.scanner.scan(
-                info["purpose"]["value"])
-        return info
+        # Scan everything — catches names in topic/purpose
+        return self._scan_obj(info)
