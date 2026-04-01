@@ -233,7 +233,7 @@ class TestOrgReplacement:
         assert result["url"] == "https://medica.atlassian.net"
 
     def test_case_preserving(self):
-        result = _replace_org_in_obj({"name": "Org_Name Technologies"})
+        result = _replace_org_in_obj({"name": "Org_name Technologies"})
         assert result["name"] == "Medica Technologies"
 
     def test_rewrite_key(self):

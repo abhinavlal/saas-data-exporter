@@ -245,7 +245,7 @@ class TestOrgReplacement:
             "name": "org_name/repo",
             "url": "https://github.com/org_name/repo",
             "items": ["org_name-service", "other"],
-            "nested": {"org": "Org_Name"},
+            "nested": {"org": "Org_name"},
         }
         result = _replace_org_in_obj(data)
         assert result["name"] == "medica/repo"
