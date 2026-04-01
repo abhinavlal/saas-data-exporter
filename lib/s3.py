@@ -120,6 +120,18 @@ class S3Store:
                 return None
             raise
 
+    def download_bytes(self, s3_path: str) -> bytes | None:
+        """Download raw bytes. Returns None on NoSuchKey."""
+        try:
+            resp = self._client.get_object(
+                Bucket=self.bucket, Key=self._key(s3_path),
+            )
+            return resp["Body"].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                return None
+            raise
+
     def exists(self, s3_path: str) -> bool:
         try:
             self._client.head_object(

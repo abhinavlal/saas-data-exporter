@@ -5,7 +5,7 @@ import pytest
 from moto import mock_aws
 
 from lib.s3 import S3Store
-from scripts.pii_mask_confluence import (
+from scripts.deprecated.pii_mask_confluence import (
     _hash_account_id, _hash_text,
     mask_page, mask_confluence_exports,
 )

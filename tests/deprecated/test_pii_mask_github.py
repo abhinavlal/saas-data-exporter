@@ -7,7 +7,7 @@ import pytest
 from moto import mock_aws
 
 from lib.s3 import S3Store
-from scripts.pii_mask_github import (
+from scripts.deprecated.pii_mask_github import (
     _hash, _hash_email, _hash_login, _hash_name, _hash_url,
     _hash_text, _mask_body, _replace_org_in_obj, _rewrite_key,
     mask_pr, mask_contributors, mask_repo_metadata,

@@ -4,6 +4,9 @@
 *.json.key
 service-account.json
 
+# Roster (contains real↔fake identity mapping — sensitive)
+roster.json
+
 # Input CSV files (contain real data)
 github_repos.csv
 jira_projects.csv

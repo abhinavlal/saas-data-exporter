@@ -11,7 +11,7 @@ import pytest
 from moto import mock_aws
 
 from lib.s3 import S3Store
-from scripts.pii_mask_bigquery import (
+from scripts.deprecated.pii_mask_bigquery import (
     mask_parquet,
     mask_bigquery_parquet,
     _parse_struct_fields,

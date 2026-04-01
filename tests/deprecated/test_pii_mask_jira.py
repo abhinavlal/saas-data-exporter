@@ -5,7 +5,7 @@ import pytest
 from moto import mock_aws
 
 from lib.s3 import S3Store
-from scripts.pii_mask_jira import (
+from scripts.deprecated.pii_mask_jira import (
     _hash_email, _hash_name, _hash_account_id, _hash_text,
     _mask_adf, _replace_org_in_obj, _rewrite_key,
     mask_ticket, mask_jira_exports,
