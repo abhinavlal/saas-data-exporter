@@ -82,3 +82,21 @@ class TestScannerWithStore:
     def test_scanner_works_on_short_text(self, scanner):
         """Scanner returns short text unchanged."""
         assert scanner.scan("Hi") == "Hi"
+
+
+class TestRosterRecognizer:
+    """Verify the AC-backed roster recognizer catches names that
+    spaCy NER might miss (e.g., in short/ambiguous context).
+    These tests use a real TextScanner (not the shortcut fixture)."""
+
+    def test_roster_name_caught_in_short_context(self, store):
+        """Names in the store are caught even in minimal context."""
+        store.get_or_create("PERSON", "Rajesh Kumar")
+        scanner = TextScanner(store, threshold=0.5)
+        result = scanner.scan("assigned to Rajesh Kumar")
+        assert "Rajesh Kumar" not in result
+
+    def test_gst_number_detected(self, store):
+        scanner = TextScanner(store, threshold=0.5)
+        result = scanner.scan("GST: 27AABCU9603R1ZM for invoice")
+        assert "27AABCU9603R1ZM" not in result

@@ -111,6 +111,15 @@ class TestIndianPII:
         assert "org_name.com" not in result
         assert "example.com" in result
 
+    def test_gst_number(self, store):
+        result = store.get_or_create("IN_GST", "27AABCU9603R1ZM")
+        assert "27AABCU9603R1ZM" not in result
+
+    def test_org_name(self, store):
+        result = store.get_or_create("ORG_NAME", "Acme Corp")
+        assert result != "Acme Corp"
+        assert len(result) > 0
+
 
 class TestDomainMap:
     def test_add_and_retrieve(self, store):

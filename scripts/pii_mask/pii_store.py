@@ -243,12 +243,22 @@ class PIIStore:
             h = self._hash(real_value, 14)
             return "".join(str(int(c, 16) % 10) for c in h)
 
+        if entity_type == "IN_GST":
+            # Structurally valid fake GST: 2-digit state + fake PAN + 1Z1
+            h = self._hash(real_value, 10)
+            return f"00ZZZZZ0000Z1Z{h[0].upper()}"
+
         if entity_type == "GEO_COORDINATE":
-            # Replace with a generic location (0°N, 0°E)
             h = self._hash(real_value, 8)
             lat = int(h[:4], 16) % 180 - 90
             lon = int(h[4:], 16) % 360 - 180
             return f"{lat}.0000,{lon}.0000"
+
+        if entity_type == "ORG_NAME":
+            return fake.company()
+
+        if entity_type == "NRP":
+            return "[REDACTED-NRP]"
 
         # -- Service-specific types --
         if entity_type == "GITHUB_LOGIN":
