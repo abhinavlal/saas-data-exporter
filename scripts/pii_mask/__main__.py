@@ -43,7 +43,9 @@ def main():
     parser.add_argument("--dst-bucket", default=env("S3_MASKED_BUCKET"),
                         help="Destination S3 bucket (default: S3_MASKED_BUCKET)")
     parser.add_argument("--s3-prefix", default=env("S3_PREFIX", ""),
-                        help="S3 key prefix")
+                        help="Source S3 key prefix")
+    parser.add_argument("--dst-prefix", default=env("S3_DST_PREFIX"),
+                        help="Destination S3 key prefix (required)")
     parser.add_argument("--exporters", nargs="*", default=None,
                         choices=ALL_EXPORTERS,
                         help="Exporters to mask (default: all)")
@@ -79,6 +81,10 @@ def main():
         parser.error("--src-bucket is required (or set S3_BUCKET)")
     if not args.dst_bucket:
         parser.error("--dst-bucket is required (or set S3_MASKED_BUCKET)")
+    if not args.dst_prefix:
+        parser.error("--dst-prefix is required (or set S3_DST_PREFIX). "
+                     "This prevents accidental overwrites when src and "
+                     "dst buckets are the same.")
 
     import os
     log_file = os.path.join(args.log_dir, "pii_mask.log")
@@ -130,14 +136,17 @@ def main():
             ))
 
     src = S3Store(bucket=args.src_bucket, prefix=args.s3_prefix)
-    dst = S3Store(bucket=args.dst_bucket, prefix=args.s3_prefix)
+    dst = S3Store(bucket=args.dst_bucket, prefix=args.dst_prefix)
     checkpoint = CheckpointManager(dst, "pii_mask/pipeline")
     checkpoint.load()
     manifest = Manifest(args.src_bucket, args.dst_bucket)
 
+    src_path = f"{args.src_bucket}/{args.s3_prefix}" if args.s3_prefix \
+        else args.src_bucket
+    dst_path = f"{args.dst_bucket}/{args.dst_prefix}"
     log.info("Starting PII masking pipeline: %s -> %s "
              "(roster: %d users, exporters: %s, workers: %d, ner: %s)",
-             args.src_bucket, args.dst_bucket, len(roster.users),
+             src_path, dst_path, len(roster.users),
              ", ".join(selected), args.max_workers,
              "enabled" if args.enable_ner else "disabled")
 
