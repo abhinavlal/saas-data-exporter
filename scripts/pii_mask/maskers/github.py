@@ -11,9 +11,6 @@ log = logging.getLogger(__name__)
 class GitHubMasker(BaseMasker):
     prefix = "github/"
 
-    def should_process(self, key: str) -> bool:
-        return key.endswith(".json")
-
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
         if data is None:
@@ -27,10 +24,7 @@ class GitHubMasker(BaseMasker):
             data = self._mask_contributors(data)
         elif filename == "repo_metadata.json":
             data = self._mask_repo_metadata(data)
-        elif filename == "_stats.json":
-            pass
         else:
-            # Unknown file type — still scan all strings
             data = self._scan_obj(data)
 
         dst_key = self.rewrite_key(key)

@@ -111,10 +111,3 @@ class BigQueryMasker(BaseMasker):
         full_key = store._key(key)
         return f"s3://{store.bucket}/{full_key}"
 
-    def _mask_stats(self, src: S3Store, dst: S3Store) -> None:
-        """Copy _stats.json without masking."""
-        stats_key = f"bigquery/{self.dataset}/_stats.json"
-        stats = src.download_json(stats_key)
-        if stats is not None:
-            dst.upload_json(stats, stats_key)
-            log.info("Copied %s", stats_key)

@@ -12,7 +12,7 @@ class ConfluenceMasker(BaseMasker):
     prefix = "confluence/"
 
     def should_process(self, key: str) -> bool:
-        return key.endswith(".json") and "/attachments/" not in key
+        return super().should_process(key) and "/attachments/" not in key
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
@@ -21,10 +21,8 @@ class ConfluenceMasker(BaseMasker):
 
         filename = key.rsplit("/", 1)[-1]
 
-        if "/pages/" in key and filename != "_index.json":
+        if "/pages/" in key:
             data = self._mask_page(data)
-        elif filename in ("_stats.json", "_index.json"):
-            pass
         else:
             data = self._scan_obj(data)
 

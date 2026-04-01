@@ -12,7 +12,7 @@ class SlackMasker(BaseMasker):
     prefix = "slack/"
 
     def should_process(self, key: str) -> bool:
-        return key.endswith(".json") and "/attachments/" not in key
+        return super().should_process(key) and "/attachments/" not in key
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
@@ -25,8 +25,6 @@ class SlackMasker(BaseMasker):
             data = [self._mask_message(m) for m in data]
         elif filename == "channel_info.json":
             data = self._mask_channel_info(data)
-        elif filename in ("_stats.json", "_index.json"):
-            pass
         else:
             data = self._scan_obj(data)
 

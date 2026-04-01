@@ -3,13 +3,19 @@
 Scans ALL headers and body parts using the Presidio-powered scanner.
 No header is skipped — Delivered-To, Return-Path, Received, DKIM,
 Authentication-Results, etc. all get domain + PII replacement.
+
+Final pass: AC automaton sweep on raw bytes catches PII in encoded
+content (iCalendar CN= fields, quoted-printable HTML).
 """
 
 import email
 import email.utils
 import email.policy
 import logging
+import threading
 from email.message import EmailMessage
+
+import ahocorasick
 
 from scripts.pii_mask.scanner import TextScanner
 
@@ -22,10 +28,20 @@ _ADDRESS_HEADERS = frozenset({
     "x-forwarded-to", "envelope-to",
 })
 
-# Headers to skip entirely (binary/structural, no PII)
+# Headers to skip Presidio NER on (transport/crypto — no human PII,
+# and running NER on them is slow + useless). Domain sweep via raw
+# byte pass catches domains in these.
 _SKIP_HEADERS = frozenset({
     "content-type", "content-transfer-encoding", "content-disposition",
     "mime-version", "content-id", "content-length",
+    "received", "received-spf", "authentication-results",
+    "arc-authentication-results", "arc-message-signature", "arc-seal",
+    "dkim-signature", "domainkey-signature",
+    "message-id", "references", "in-reply-to",
+    "x-google-dkim-signature", "x-gm-message-state",
+    "x-google-smtp-source", "x-received",
+    "x-ses-outgoing", "feedback-id",
+    "date", "x-mailer", "x-priority",
 })
 
 
@@ -69,13 +85,98 @@ def mask_eml(eml_bytes: bytes, scanner: TextScanner) -> bytes:
     # Convert back to bytes
     masked_bytes = msg.as_bytes()
 
-    # Final domain sweep on raw bytes — catches domains in DKIM signatures,
-    # Received headers, and other places the parser might not expose
-    for real_domain, fake_domain in scanner._store.domain_map.items():
-        masked_bytes = masked_bytes.replace(
-            real_domain.encode(), fake_domain.encode())
+    # Final raw byte sweep — catches PII in encoded content that the
+    # MIME parser doesn't expose: iCalendar CN= fields, quoted-printable
+    # HTML, DKIM signatures, etc.
+    masked_bytes = _raw_byte_sweep(masked_bytes, scanner)
 
     return masked_bytes
+
+
+# Module-level cache for the byte sweep AC automaton.
+# Built once, reused across all EML files (thread-safe after build).
+_byte_sweep_lock = threading.Lock()
+_byte_sweep_cache: dict[str, tuple] = {}  # db_path → (automaton, domain_pairs)
+
+
+def _get_byte_sweep_automaton(scanner: TextScanner):
+    """Build (or retrieve cached) AC automaton for raw byte sweep.
+
+    Built once from the PIIStore, then reused for all EML files.
+    O(n) per file instead of O(patterns × file_size).
+    """
+    db_path = scanner._store._db_path
+
+    with _byte_sweep_lock:
+        if db_path in _byte_sweep_cache:
+            return _byte_sweep_cache[db_path]
+
+    store = scanner._store
+    con = store._get_connection()
+
+    A = ahocorasick.Automaton()
+    rows = con.execute(
+        "SELECT real_value, masked_value FROM roster_entries "
+        "WHERE entity_type IN ('PERSON', 'EMAIL_ADDRESS') "
+        "  AND LENGTH(real_value) >= 6"
+    ).fetchall()
+
+    count = 0
+    for real_val, masked_val in rows:
+        key = real_val.lower()
+        A.add_word(key, (real_val, masked_val))
+        count += 1
+
+    if count > 0:
+        A.make_automaton()
+
+    domain_pairs = [(r.encode(), f.encode())
+                    for r, f in store.domain_map.items()]
+
+    result = (A if count > 0 else None, domain_pairs)
+
+    with _byte_sweep_lock:
+        _byte_sweep_cache[db_path] = result
+
+    log.info("EML byte sweep automaton: %d patterns cached", count)
+    return result
+
+
+def _raw_byte_sweep(data: bytes, scanner: TextScanner) -> bytes:
+    """Replace known PII in raw bytes using cached AC automaton.
+
+    O(n) per file. Catches PII in iCalendar CN= fields,
+    quoted-printable encoded HTML, DKIM signatures, etc.
+    """
+    automaton, domain_pairs = _get_byte_sweep_automaton(scanner)
+
+    # AC sweep for PERSON + EMAIL_ADDRESS
+    if automaton is not None:
+        text = data.decode("utf-8", errors="replace")
+        text_lower = text.lower()
+
+        # Collect matches
+        matches = []
+        last_end = 0
+        for end_idx, (real_val, masked_val) in automaton.iter(text_lower):
+            start = end_idx - len(real_val) + 1
+            if start >= last_end:
+                # Find original-case match in text for replacement
+                matches.append((start, end_idx + 1, masked_val))
+                last_end = end_idx + 1
+
+        # Apply replacements right-to-left
+        if matches:
+            chars = list(text)
+            for start, end, replacement in reversed(matches):
+                chars[start:end] = list(replacement)
+            data = "".join(chars).encode("utf-8", errors="replace")
+
+    # Domain sweep (only 3 entries — fast)
+    for real_bytes, fake_bytes in domain_pairs:
+        data = data.replace(real_bytes, fake_bytes)
+
+    return data
 
 
 def _mask_address_header(header_value: str,

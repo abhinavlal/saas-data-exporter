@@ -15,9 +15,6 @@ log = logging.getLogger(__name__)
 class GoogleMasker(BaseMasker):
     prefix = "google/"
 
-    def should_process(self, key: str) -> bool:
-        return key.endswith(".json") or key.endswith(".eml")
-
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         if key.endswith(".eml"):
             return self._mask_eml_file(src, dst, key)

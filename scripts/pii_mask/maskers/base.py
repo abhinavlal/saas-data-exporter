@@ -11,12 +11,20 @@ log = logging.getLogger(__name__)
 class BaseMasker:
     """Base class for per-exporter maskers.
 
-    Subclasses declare which S3 prefix they handle and implement
-    ``mask_file`` for per-file masking logic.
-
-    The ``_scan_obj`` method recursively runs ``scanner.scan()`` on
-    every string value — this is the universal safety net.
+    Skips exporter infrastructure files (_index.json, _stats.json).
+    The ``_scan_obj`` method runs Presidio on every string value.
     """
+
+    # Infrastructure files created by exporters — skip during masking.
+    # These are checkpoint/index/stats files, not user data.
+    _SKIP_FILENAMES = frozenset({
+        "_index.json",
+        "_stats.json",
+    })
+    _SKIP_PREFIXES = (
+        "_checkpoints/",
+        "_manifest/",
+    )
 
     prefix: str = ""  # S3 prefix, e.g. "github/"
 
@@ -29,8 +37,17 @@ class BaseMasker:
                 if self.should_process(k)]
 
     def should_process(self, key: str) -> bool:
-        """Whether this masker should handle the given S3 key."""
-        return key.endswith(".json")
+        """Whether this masker should handle the given S3 key.
+
+        Skips exporter infrastructure files (_index.json, _stats.json,
+        _checkpoints/) — these are not user data.
+        """
+        if any(key.startswith(p) for p in self._SKIP_PREFIXES):
+            return False
+        filename = key.rsplit("/", 1)[-1]
+        if filename in self._SKIP_FILENAMES:
+            return False
+        return key.endswith(".json") or key.endswith(".eml")
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         """Download, mask, and upload one file. Returns status string."""

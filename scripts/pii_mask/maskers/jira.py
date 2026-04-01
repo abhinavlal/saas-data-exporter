@@ -12,7 +12,7 @@ class JiraMasker(BaseMasker):
     prefix = "jira/"
 
     def should_process(self, key: str) -> bool:
-        return key.endswith(".json") and "/attachments/" not in key
+        return super().should_process(key) and "/attachments/" not in key
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
@@ -21,10 +21,8 @@ class JiraMasker(BaseMasker):
 
         filename = key.rsplit("/", 1)[-1]
 
-        if "/tickets/" in key and filename != "_index.json":
+        if "/tickets/" in key:
             data = self._mask_ticket(data)
-        elif filename in ("_stats.json", "_index.json"):
-            pass
         else:
             data = self._scan_obj(data)
 
