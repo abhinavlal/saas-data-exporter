@@ -49,77 +49,161 @@ _INFRA_PREFIXES = ("_checkpoints/", "_manifest/")
 
 # -- Check 1+2: Store + domain leakage via Aho-Corasick ------------------- #
 
-def build_leak_automaton(store: PIIStore) -> ahocorasick.Automaton:
-    """Build an AC automaton from all real PII values in the store.
+def build_leak_scanner(store: PIIStore) -> dict:
+    """Build search structures for PII leak detection.
 
-    O(n) scan per file — fast even with thousands of search terms.
-    Only includes terms >= 5 chars to avoid false positives from
-    short strings like 'dev', 'user', 'test'.
+    Returns separate matchers for different signal levels:
+    - emails: AC automaton (exact substring, very high signal)
+    - domains: simple list (exact substring)
+    - names: AC automaton with word-boundary post-check (full names only, >= 8 chars)
+
+    Skips opaque IDs (SLACK_USER_ID, JIRA_ACCOUNT_ID, GITHUB_LOGIN,
+    SLACK_USERNAME) — these are system identifiers, not human-readable
+    PII that someone would recognize.
     """
-    A = ahocorasick.Automaton()
     con = store._get_connection()
 
-    # Only search for entries from the roster import (known org members).
-    # Entries auto-added by Presidio during masking (source != 'roster_import')
-    # include common words and external URLs — not useful for leak detection.
-    # Also include high-value types regardless of source.
-    _HIGH_VALUE_TYPES = ("EMAIL_ADDRESS", "IN_PAN", "IN_AADHAAR",
-                         "IN_UPI_ID", "CREDIT_CARD", "US_SSN", "IBAN_CODE")
+    # -- Email AC (highest signal, exact match) --
+    email_ac = ahocorasick.Automaton()
+    email_count = 0
+    rows = con.execute(
+        "SELECT real_value FROM roster_entries "
+        "WHERE entity_type = 'EMAIL_ADDRESS' AND source = 'roster_import'"
+    ).fetchall()
+    for (val,) in rows:
+        key = val.lower()
+        if len(key) >= 5:
+            email_ac.add_word(key, val)
+            email_count += 1
+    if email_count > 0:
+        email_ac.make_automaton()
 
+    # -- Name AC (full names only, >= 8 chars, word-boundary check) --
+    name_ac = ahocorasick.Automaton()
+    name_count = 0
+    rows = con.execute(
+        "SELECT real_value FROM roster_entries "
+        "WHERE entity_type = 'PERSON' AND source = 'roster_import' "
+        "  AND LENGTH(real_value) >= 8"
+    ).fetchall()
+    for (val,) in rows:
+        key = val.lower()
+        # Only full names (contain a space = first + last)
+        if " " not in key:
+            continue
+        name_ac.add_word(key, val)
+        name_count += 1
+    if name_count > 0:
+        name_ac.make_automaton()
+
+    # -- High-value types AC (PAN, Aadhaar, UPI, credit card, etc.) --
+    sensitive_ac = ahocorasick.Automaton()
+    sensitive_count = 0
+    _SENSITIVE_TYPES = ("IN_PAN", "IN_AADHAAR", "IN_UPI_ID",
+                        "CREDIT_CARD", "US_SSN", "IBAN_CODE", "IN_GST")
     rows = con.execute(
         "SELECT entity_type, real_value FROM roster_entries "
-        "WHERE source = 'roster_import' "
-        "   OR entity_type IN (?, ?, ?, ?, ?, ?, ?)",
-        _HIGH_VALUE_TYPES,
+        "WHERE entity_type IN ({})".format(
+            ",".join(f"'{t}'" for t in _SENSITIVE_TYPES))
     ).fetchall()
-    count = 0
-    for entity_type, real_value in rows:
-        key = real_value.lower()
-        if len(key) < 5:
-            continue
-        A.add_word(key, (entity_type, real_value))
-        count += 1
+    for entity_type, val in rows:
+        key = val.lower()
+        if len(key) >= 5:
+            sensitive_ac.add_word(key, (entity_type, val))
+            sensitive_count += 1
+    if sensitive_count > 0:
+        sensitive_ac.make_automaton()
 
-    # Real domains
-    for real_domain in store.domain_map:
-        key = real_domain.lower()
-        A.add_word(key, ("DOMAIN", real_domain))
-        count += 1
+    # -- Domains --
+    domains = [d.lower() for d in store.domain_map]
 
-    if count > 0:
-        A.make_automaton()
-    log.info("Leak scanner: %d search terms from PIIStore", count)
-    return A
+    log.info("Leak scanner: %d emails, %d full names, %d sensitive IDs, "
+             "%d domains",
+             email_count, name_count, sensitive_count, len(domains))
+
+    return {
+        "email_ac": email_ac if email_count > 0 else None,
+        "name_ac": name_ac if name_count > 0 else None,
+        "sensitive_ac": sensitive_ac if sensitive_count > 0 else None,
+        "domains": domains,
+        "email_count": email_count,
+        "name_count": name_count,
+    }
 
 
-def check_leakage(automaton: ahocorasick.Automaton,
-                  content: str, key: str) -> list[dict]:
-    """Scan content for any real PII values using AC automaton."""
+def check_leakage(scanner: dict, content: str,
+                  key: str) -> list[dict]:
+    """Scan content for real PII leaks. Tuned for zero false positives."""
     if not content:
         return []
 
     findings = []
     content_lower = content.lower()
-    seen = set()  # dedup within one file
+    seen = set()
 
-    for end_idx, (entity_type, real_value) in automaton.iter(content_lower):
-        if real_value in seen:
-            continue
-        seen.add(real_value)
+    # 1. Email leaks (highest signal — exact substring)
+    if scanner["email_ac"]:
+        for end_idx, real_email in scanner["email_ac"].iter(content_lower):
+            if real_email in seen:
+                continue
+            seen.add(real_email)
+            findings.append({
+                "file": key, "type": "EMAIL_ADDRESS",
+                "real_value": real_email,
+                "context": _context(content, end_idx, real_email),
+            })
 
-        start_idx = end_idx - len(real_value) + 1
-        context_start = max(0, start_idx - 30)
-        context_end = min(len(content), end_idx + 31)
-        context = content[context_start:context_end].replace("\n", " ")
+    # 2. Full name leaks (word-boundary check to avoid substring matches)
+    if scanner["name_ac"]:
+        for end_idx, real_name in scanner["name_ac"].iter(content_lower):
+            if real_name in seen:
+                continue
+            start = end_idx - len(real_name) + 1
+            end = end_idx + 1
+            # Word boundary: char before start and after end must not be
+            # alphanumeric (avoids "robert" matching inside "Robertson")
+            if start > 0 and content_lower[start - 1].isalnum():
+                continue
+            if end < len(content_lower) and content_lower[end].isalnum():
+                continue
+            seen.add(real_name)
+            findings.append({
+                "file": key, "type": "PERSON",
+                "real_value": real_name,
+                "context": _context(content, end_idx, real_name),
+            })
 
-        findings.append({
-            "file": key,
-            "type": entity_type,
-            "real_value": real_value,
-            "context": context,
-        })
+    # 3. Sensitive ID leaks (PAN, Aadhaar, etc.)
+    if scanner["sensitive_ac"]:
+        for end_idx, (etype, real_val) in \
+                scanner["sensitive_ac"].iter(content_lower):
+            if real_val in seen:
+                continue
+            seen.add(real_val)
+            findings.append({
+                "file": key, "type": etype,
+                "real_value": real_val,
+                "context": _context(content, end_idx, real_val),
+            })
+
+    # 4. Domain leaks
+    for domain in scanner["domains"]:
+        if domain in content_lower and domain not in seen:
+            seen.add(domain)
+            idx = content_lower.find(domain)
+            findings.append({
+                "file": key, "type": "DOMAIN",
+                "real_value": domain,
+                "context": content[max(0, idx - 30):idx + len(domain) + 30],
+            })
 
     return findings
+
+
+def _context(content: str, end_idx: int, value: str) -> str:
+    start = max(0, end_idx - len(value) - 29)
+    end = min(len(content), end_idx + 31)
+    return content[start:end].replace("\n", " ").strip()
 
 
 # -- Check 3: Readability ------------------------------------------------- #
@@ -293,14 +377,14 @@ def run_validation(src: S3Store, store: PIIStore,
     log.info("Downloaded %d files (%d JSON, %d text)",
              len(raw_files), len(json_files), len(text_files))
 
-    # Build AC automaton from all real PII values
-    automaton = build_leak_automaton(store)
+    # Build targeted leak scanner
+    leak_scanner = build_leak_scanner(store)
 
-    # Check 1+2: PII + domain leakage (AC scan — fast, zero false positives)
-    log.info("Check 1: PII leakage scan (AC automaton)...")
+    # Check 1: PII leakage (emails, full names, sensitive IDs, domains)
+    log.info("Check 1: PII leakage scan...")
     leaks = []
     for key, text in text_files.items():
-        leaks.extend(check_leakage(automaton, text, key))
+        leaks.extend(check_leakage(leak_scanner, text, key))
     log.info("  Leaks found: %d", len(leaks))
 
     leak_by_type: dict[str, int] = {}
