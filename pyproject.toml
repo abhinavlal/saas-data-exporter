@@ -33,6 +33,9 @@ ner = [
     "presidio-anonymizer>=2.2",
     "spacy>=3.7",
 ]
+validate = [
+    "anthropic>=0.40",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["lib", "exporters", "scripts"]
