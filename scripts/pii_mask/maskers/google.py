@@ -15,6 +15,29 @@ log = logging.getLogger(__name__)
 class GoogleMasker(BaseMasker):
     prefix = "google/"
 
+    def __init__(self, scanner, users: set[str] | None = None):
+        super().__init__(scanner)
+        # Optional user filter: set of emails like {"john@practo.com"}
+        # Converted to S3 slug format: {"john_at_practo.com"}
+        self._user_slugs = None
+        if users:
+            self._user_slugs = {
+                u.replace("@", "_at_") for u in users
+            }
+
+    def list_keys(self, src: S3Store) -> list[str]:
+        keys = super().list_keys(src)
+        if self._user_slugs is None:
+            return keys
+        return [k for k in keys
+                if self._user_slug_from_key(k) in self._user_slugs]
+
+    @staticmethod
+    def _user_slug_from_key(key: str) -> str:
+        """Extract user slug from google/{slug}/..."""
+        parts = key.split("/", 2)
+        return parts[1] if len(parts) >= 2 else ""
+
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         if key.endswith(".eml"):
             return self._mask_eml_file(src, dst, key)

@@ -69,6 +69,10 @@ def main():
                         default=env("PII_TARGET_DOMAIN", "example-health.com"))
     parser.add_argument("--s3-region", default=env("AWS_DEFAULT_REGION"))
 
+    # Google user filtering
+    parser.add_argument("--google-users-csv", default=None,
+                        help="CSV file with 'user' column — only mask these Google users")
+
     # Scanner
     parser.add_argument("--presidio-threshold", type=float, default=0.5,
                         help="Presidio confidence threshold (default: 0.5)")
@@ -119,7 +123,15 @@ def main():
         elif name == "slack":
             maskers.append(SlackMasker(scanner))
         elif name == "google":
-            maskers.append(GoogleMasker(scanner))
+            google_users = None
+            if args.google_users_csv:
+                import csv
+                with open(args.google_users_csv) as f:
+                    reader = csv.DictReader(f)
+                    google_users = {row["user"].strip() for row in reader}
+                log.info("Google user filter: %d users from %s",
+                         len(google_users), args.google_users_csv)
+            maskers.append(GoogleMasker(scanner, users=google_users))
         elif name == "bigquery":
             if not args.dataset:
                 parser.error("--dataset is required for bigquery exporter")
