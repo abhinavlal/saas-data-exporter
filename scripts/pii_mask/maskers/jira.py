@@ -107,3 +107,9 @@ class JiraMasker(BaseMasker):
                 "PERSON", entry.get("from", ""))
             entry["to"] = self.scanner.scan_structured(
                 "PERSON", entry.get("to", ""))
+        else:
+            # All other changelog from/to values: full scan for PII + domains
+            if entry.get("from"):
+                entry["from"] = self.scanner.scan(entry["from"])
+            if entry.get("to"):
+                entry["to"] = self.scanner.scan(entry["to"])

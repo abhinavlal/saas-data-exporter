@@ -63,6 +63,7 @@ class PIIStore:
         self._cache: dict[tuple[str, str], str] = {}
         self._cache_lock = threading.Lock()
         self._domain_map: dict[str, str] = {}
+        self._company_names: dict[str, str] = {}  # company → fake_company
 
         # Initialize schema on the main connection
         con = self._get_connection()
@@ -73,6 +74,17 @@ class PIIStore:
         rows = con.execute("SELECT real_domain, masked_domain FROM domain_map").fetchall()
         for real, masked in rows:
             self._domain_map[real.lower()] = masked
+
+        # Reconstruct company names from domain map: for each domain like
+        # "practo.com" → "faulkner-howard.com", extract "practo" → "faulkner-howard"
+        for real_domain, fake_domain in self._domain_map.items():
+            parts = real_domain.split(".")
+            fake_parts = fake_domain.split(".")
+            if len(parts) >= 2 and len(fake_parts) >= 2:
+                company = parts[0]
+                fake_company = fake_parts[0]
+                if len(company) >= 6 and company not in self._company_names:
+                    self._company_names[company] = fake_company
 
         # Pre-warm cache from existing entries
         rows = con.execute(
@@ -108,6 +120,7 @@ class PIIStore:
         """Look up replacement, or generate + store a new one.
 
         Thread-safe: uses INSERT OR IGNORE + SELECT to handle races.
+        For EMAIL_ADDRESS, auto-discovers and registers the domain.
         """
         if not real_value:
             return real_value
@@ -118,6 +131,10 @@ class PIIStore:
         with self._cache_lock:
             if key in self._cache:
                 return self._cache[key]
+
+        # Auto-discover company domains from email addresses
+        if entity_type == "EMAIL_ADDRESS" and "@" in real_value:
+            self._auto_discover_domain(real_value.rsplit("@", 1)[1])
 
         # Generate fake
         masked_value = self._generate_fake(entity_type, real_value)
@@ -157,14 +174,23 @@ class PIIStore:
     def domain_map(self) -> dict[str, str]:
         return dict(self._domain_map)
 
+    @property
+    def company_names(self) -> dict[str, str]:
+        return dict(self._company_names)
+
     def add_domain(self, real: str, masked: str) -> None:
         con = self._get_connection()
         con.execute(
-            "INSERT OR REPLACE INTO domain_map (real_domain, masked_domain) "
+            "INSERT OR IGNORE INTO domain_map (real_domain, masked_domain) "
             "VALUES (?, ?)", (real.lower(), masked),
         )
         con.commit()
-        self._domain_map[real.lower()] = masked
+        # Read back (another process may have inserted a different value)
+        row = con.execute(
+            "SELECT masked_domain FROM domain_map WHERE real_domain = ?",
+            (real.lower(),),
+        ).fetchone()
+        self._domain_map[real.lower()] = row[0] if row else masked
 
     def map_domain(self, domain: str) -> str:
         return self._domain_map.get(domain.lower(), domain)
@@ -175,6 +201,71 @@ class PIIStore:
             return email
         local, domain = email.rsplit("@", 1)
         return f"{local}@{self.map_domain(domain)}"
+
+    # -- Auto-domain discovery --------------------------------------------- #
+
+    # Generic email providers and service domains — don't register as company
+    _GENERIC_DOMAINS = frozenset({
+        "gmail.com", "googlemail.com", "outlook.com", "hotmail.com",
+        "live.com", "yahoo.com", "yahoo.co.in", "aol.com", "icloud.com",
+        "protonmail.com", "proton.me", "zoho.com", "yandex.com",
+        "mail.com", "rediffmail.com", "msn.com",
+        "example.com", "example.org",       # already fake
+        "resource.calendar.google.com",      # Google room resources
+    })
+
+    # Domains that are well-known services — skip auto-discovery for
+    # anything that is or ends with these (prevents mapping "github",
+    # "docs", "mail", etc. as company names).
+    _SERVICE_SUFFIXES = (
+        "google.com", "github.com", "github.io", "slack.com",
+        "atlassian.net", "atlassian.com", "hubspot.com",
+        "amazonaws.com", "amazonses.com", "amazon.com",
+        "microsoft.com", "office365.com", "office.com",
+        "salesforce.com", "zendesk.com", "intercom.io",
+        "stripe.com", "twilio.com", "sendgrid.net",
+        "mailchimp.com", "mandrill.com",
+        "bounces.google.com", "googlegroups.com",
+    )
+
+    def _auto_discover_domain(self, domain: str) -> None:
+        """Auto-register a company email domain.
+
+        Only adds the full domain to domain_map (e.g. practo.com → fakeco.com).
+        Company-name-in-subdomain patterns (e.g. practo.atlassian.net) are
+        handled by _domain_replace via the company_names dict.
+
+        Skips generic providers and well-known service domains.
+        """
+        domain = domain.lower()
+        if domain in self._GENERIC_DOMAINS or domain in self._domain_map:
+            return
+
+        # Skip subdomains of known services (e.g. docs.google.com, bcc.hubspot.com)
+        if any(domain == suf or domain.endswith("." + suf)
+               for suf in self._SERVICE_SUFFIXES):
+            return
+
+        # Only handle simple company domains (company.tld or company.co.tld)
+        parts = domain.split(".")
+        if len(parts) < 2 or len(parts) > 3:
+            return  # skip complex subdomains like a.b.c.d
+        company = parts[0]
+        if len(company) < 3:
+            return  # too short, risk of false matches
+
+        # Generate fake company name (lowercase, no spaces)
+        fake_company = fake.company().split()[0].lower().replace(",", "")
+        tld = ".".join(parts[1:])
+
+        self.add_domain(domain, f"{fake_company}.{tld}")
+        # Store company name for full-text replacement (≥6 chars to
+        # avoid common-word collisions like "marsh", "delta", "bata").
+        # Shorter names still get full-domain replacement via domain_map.
+        if len(company) >= 6:
+            self._company_names[company] = fake_company
+        log.info("Auto-discovered domain: %s → %s.%s",
+                 domain, fake_company, tld)
 
     # -- Fake generation --------------------------------------------------- #
 

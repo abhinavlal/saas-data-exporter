@@ -13,6 +13,7 @@ Includes:
 """
 
 import logging
+import re
 from typing import List
 
 import ahocorasick
@@ -32,14 +33,15 @@ _BUILTIN_ENTITIES = [
     "PERSON",
     "EMAIL_ADDRESS",
     "PHONE_NUMBER",
-    "LOCATION",
     "CREDIT_CARD",
     "IP_ADDRESS",
     "US_SSN",
     "IBAN_CODE",
-    "URL",
     "MEDICAL_LICENSE",
-    "NRP",          # nationality, religion, political group
+    # Removed — too many false positives on non-PII strings:
+    #   LOCATION  — room names, office locations (Koramangala, Growth Is Oxygen)
+    #   NRP       — nationality/religion/political, overly broad
+    #   URL       — breaks functional links; domains handled by _domain_replace()
 ]
 
 _CUSTOM_ENTITIES = [
@@ -50,7 +52,7 @@ _CUSTOM_ENTITIES = [
     "IN_BANK_ACCOUNT",
     "IN_GST",
     "GEO_COORDINATE",
-    "ORG_NAME",     # company/org names — spaCy NER (ORG) + roster AC
+    "ORG_NAME",     # company/org names — roster AC only (spaCy NER disabled below)
 ]
 
 _ALL_ENTITIES = _BUILTIN_ENTITIES + _CUSTOM_ENTITIES
@@ -157,6 +159,17 @@ def _build_custom_recognizers() -> list:
 
     recognizers: list = []
 
+    # Indian mobile: +917204068324, +91 72040 68324, 917204068324
+    # Presidio's built-in PhoneRecognizer misses these when glued to text.
+    # Score 0.8 > Aadhaar 0.6 so phone wins overlap resolution.
+    recognizers.append(PatternRecognizer(
+        supported_entity="PHONE_NUMBER",
+        name="IndianMobileRecognizer",
+        patterns=[Pattern("in_mobile",
+                          r"(?<!\d)\+?91[\s-]?[6-9]\d{9}(?!\d)", 0.8)],
+        supported_language="en",
+    ))
+
     # Indian PAN: ABCPD1234E
     recognizers.append(PatternRecognizer(
         supported_entity="IN_PAN",
@@ -248,18 +261,9 @@ class TextScanner:
         log.info("Initializing Presidio analyzer...")
         self._analyzer = AnalyzerEngine()
 
-        # Enable ORG entity detection: spaCy detects ORG but Presidio
-        # ignores it by default. Remove from ignore list, map to ORG_NAME,
-        # and add ORG_NAME to the SpacyRecognizer's supported entities.
-        ner_cfg = self._analyzer.nlp_engine.ner_model_configuration
-        if "ORGANIZATION" in ner_cfg.labels_to_ignore:
-            ner_cfg.labels_to_ignore.remove("ORGANIZATION")
-        ner_cfg.model_to_presidio_entity_mapping["ORG"] = "ORG_NAME"
-        ner_cfg.model_to_presidio_entity_mapping["ORGANIZATION"] = "ORG_NAME"
-        for rec in self._analyzer.get_recognizers(language="en"):
-            if rec.name == "SpacyRecognizer":
-                if "ORG_NAME" not in rec.supported_entities:
-                    rec.supported_entities.append("ORG_NAME")
+        # ORG_NAME is handled by roster AC only — spaCy NER ORG detection
+        # is too aggressive (catches room names, team names, random phrases).
+        # Keep ORGANIZATION in the ignore list (Presidio default).
 
         # Register roster-backed recognizer (AC automaton, score 0.95)
         roster_recognizer = RosterRecognizer(store)
@@ -304,15 +308,32 @@ class TextScanner:
         if not results:
             return self._domain_replace(text)
 
+        # Drop matches shorter than 3 chars — single/double char NER hits
+        # (e.g. "K" as PERSON, "M" as PERSON) are always false positives.
+        MIN_MATCH_LEN = 3
+        results = [r for r in results if (r.end - r.start) >= MIN_MATCH_LEN]
+
         # Sort by start position, longest match first, highest score first
         results.sort(key=lambda r: (r.start, -(r.end - r.start), -r.score))
 
-        # Resolve overlaps: greedy left-to-right, longest/highest-score wins
+        # Resolve overlaps: greedy left-to-right, longest/highest-score wins.
+        # Check company/domain names dynamically inside the loop because
+        # get_or_create for an EMAIL_ADDRESS may discover new domains
+        # mid-iteration (e.g. "practo" becomes known after processing
+        # john@practo.com earlier in the same text).
         resolved = []
         last_end = 0
         for r in results:
             if r.start >= last_end:
                 real_value = text[r.start:r.end]
+                real_lower = real_value.lower()
+
+                # Skip entities that match known company/domain names —
+                # these are handled by _domain_replace, not NER replacement
+                if (real_lower in self._store._company_names
+                        or real_lower in self._store._domain_map):
+                    continue
+
                 fake_value = self._store.get_or_create(
                     r.entity_type, real_value, source=source)
                 resolved.append((r.start, r.end, fake_value))
@@ -342,8 +363,17 @@ class TextScanner:
     # -- Internal ---------------------------------------------------------- #
 
     def _domain_replace(self, text: str) -> str:
+        # Replace full domains first (e.g. practo.com → fakeco.com)
         for real_domain, fake_domain in self._store.domain_map.items():
             text = text.replace(real_domain, fake_domain)
             text = text.replace(
                 real_domain.capitalize(), fake_domain.capitalize())
+
+        # Replace company names everywhere — catches com.practo.commons,
+        # practo.atlassian.net, Practeons, etc.
+        for real_name, fake_name in self._store.company_names.items():
+            text = text.replace(real_name, fake_name)
+            text = text.replace(
+                real_name.capitalize(), fake_name.capitalize())
+            text = text.replace(real_name.upper(), fake_name.upper())
         return text

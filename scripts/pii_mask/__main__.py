@@ -151,6 +151,8 @@ def main():
         checkpoint=checkpoint,
         manifest=manifest,
         max_workers=args.max_workers,
+        store_path=args.store,
+        threshold=args.presidio_threshold,
     )
 
     # Log final store stats
