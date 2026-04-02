@@ -14,6 +14,23 @@ class ConfluenceMasker(BaseMasker):
     def should_process(self, key: str) -> bool:
         return super().should_process(key) and "/attachments/" not in key
 
+    def list_keys(self, src: S3Store) -> list[str]:
+        """Enumerate files from pages/_index.json per space."""
+        keys = []
+        spaces = self._list_entities(src)
+        for space in spaces:
+            base = f"{self.prefix}{space}"
+            idx = src.download_json(f"{base}/pages/_index.json")
+            if not idx:
+                continue
+            keys.append(f"{base}/pages/_index.json")
+            for page_id in idx:
+                if isinstance(page_id, str):
+                    keys.append(f"{base}/pages/{page_id}.json")
+        log.info("confluence: %d files across %d spaces",
+                 len(keys), len(spaces))
+        return keys
+
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
         if data is None:

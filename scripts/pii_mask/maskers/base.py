@@ -32,9 +32,33 @@ class BaseMasker:
         self.scanner = scanner
 
     def list_keys(self, src: S3Store) -> list[str]:
-        """List S3 keys this masker should process."""
+        """List S3 keys this masker should process.
+
+        Default: full S3 listing. Subclasses should override with
+        index-based enumeration to avoid listing millions of keys.
+        """
         return [k for k in src.list_keys(self.prefix)
                 if self.should_process(k)]
+
+    def _list_entities(self, src: S3Store) -> list[str]:
+        """List top-level entity dirs using S3 delimiter (no file enumeration).
+
+        Returns entity names like ["org__repo", "PROJ", "C07FMF9U08M"].
+        Single paginated S3 call with Delimiter='/' — O(entities), not O(files).
+        """
+        full_prefix = f"{src.prefix}/{self.prefix}" if src.prefix \
+            else self.prefix
+        paginator = src._client.get_paginator("list_objects_v2")
+        entities = []
+        for page in paginator.paginate(Bucket=src.bucket,
+                                       Prefix=full_prefix,
+                                       Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                # "v31/github/org__repo/" → "org__repo"
+                name = cp["Prefix"][len(full_prefix):].strip("/")
+                if name:
+                    entities.append(name)
+        return sorted(entities)
 
     def should_process(self, key: str) -> bool:
         """Whether this masker should handle the given S3 key.

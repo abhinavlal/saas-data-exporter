@@ -14,6 +14,24 @@ class JiraMasker(BaseMasker):
     def should_process(self, key: str) -> bool:
         return super().should_process(key) and "/attachments/" not in key
 
+    def list_keys(self, src: S3Store) -> list[str]:
+        """Enumerate files from tickets/_index.json per project."""
+        keys = []
+        projects = self._list_entities(src)
+        for i, project in enumerate(projects, 1):
+            base = f"{self.prefix}{project}"
+            idx = src.download_json(f"{base}/tickets/_index.json")
+            if not idx:
+                continue
+            keys.append(f"{base}/tickets/_index.json")
+            for ticket_key in idx.get("keys", []):
+                keys.append(f"{base}/tickets/{ticket_key}.json")
+            if i % 10 == 0:
+                log.info("jira: enumerated %d/%d projects (%d files)",
+                         i, len(projects), len(keys))
+        log.info("jira: %d files across %d projects", len(keys), len(projects))
+        return keys
+
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
         if data is None:

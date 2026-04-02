@@ -11,6 +11,25 @@ log = logging.getLogger(__name__)
 class GitHubMasker(BaseMasker):
     prefix = "github/"
 
+    def list_keys(self, src: S3Store) -> list[str]:
+        """Enumerate files per repo: known files + list commits/ and prs/."""
+        keys = []
+        repos = self._list_entities(src)
+        for i, repo in enumerate(repos, 1):
+            base = f"{self.prefix}{repo}"
+            # Fixed filenames
+            for name in ("repo_metadata.json", "contributors.json"):
+                keys.append(f"{base}/{name}")
+            # Commits and PRs: list per-repo subdirectory (small)
+            for subdir in ("commits/", "prs/"):
+                sub_keys = src.list_keys(f"{base}/{subdir}")
+                keys.extend(k for k in sub_keys if k.endswith(".json"))
+            if i % 20 == 0:
+                log.info("github: enumerated %d/%d repos (%d files)",
+                         i, len(repos), len(keys))
+        log.info("github: %d files across %d repos", len(keys), len(repos))
+        return keys
+
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
         if data is None:

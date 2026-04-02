@@ -14,6 +14,23 @@ class SlackMasker(BaseMasker):
     def should_process(self, key: str) -> bool:
         return super().should_process(key) and "/attachments/" not in key
 
+    def list_keys(self, src: S3Store) -> list[str]:
+        """Enumerate files from messages/_index.json per channel."""
+        keys = []
+        channels = self._list_entities(src)
+        for channel in channels:
+            base = f"{self.prefix}{channel}"
+            keys.append(f"{base}/channel_info.json")
+            idx = src.download_json(f"{base}/messages/_index.json")
+            if idx:
+                keys.append(f"{base}/messages/_index.json")
+                for ts in idx:
+                    if isinstance(ts, str):
+                        keys.append(f"{base}/messages/{ts}.json")
+        log.info("slack: %d files across %d channels",
+                 len(keys), len(channels))
+        return keys
+
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         data = src.download_json(key)
         if data is None:
