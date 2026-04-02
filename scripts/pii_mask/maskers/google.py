@@ -26,17 +26,51 @@ class GoogleMasker(BaseMasker):
             }
 
     def list_keys(self, src: S3Store) -> list[str]:
-        keys = super().list_keys(src)
         if self._user_slugs is None:
-            return keys
-        return [k for k in keys
-                if self._user_slug_from_key(k) in self._user_slugs]
+            return super().list_keys(src)
+        # Build key list from index files — no S3 listing needed.
+        # Structure: google/{slug}/gmail/{id}.eml
+        #            google/{slug}/gmail/_index.json
+        #            google/{slug}/calendar/events/{event_id}.json
+        #            google/{slug}/calendar/_index.json
+        #            google/{slug}/drive/_index.json
+        keys = []
+        for i, slug in enumerate(sorted(self._user_slugs), 1):
+            base = f"{self.prefix}{slug}"
+            user_keys = self._keys_from_indexes(src, base)
+            keys.extend(user_keys)
+            if i % 50 == 0 or i == len(self._user_slugs):
+                log.info("google: enumerated %d/%d users (%d files)",
+                         i, len(self._user_slugs), len(keys))
+        return keys
 
-    @staticmethod
-    def _user_slug_from_key(key: str) -> str:
-        """Extract user slug from google/{slug}/..."""
-        parts = key.split("/", 2)
-        return parts[1] if len(parts) >= 2 else ""
+    def _keys_from_indexes(self, src: S3Store, base: str) -> list[str]:
+        """Derive all file keys from a user's index files."""
+        keys = []
+
+        # Gmail: _index.json has [{id, ...}, ...] → gmail/{id}.eml
+        gmail_idx = src.download_json(f"{base}/gmail/_index.json")
+        if gmail_idx:
+            keys.append(f"{base}/gmail/_index.json")
+            for entry in gmail_idx:
+                msg_id = entry.get("id") if isinstance(entry, dict) else None
+                if msg_id:
+                    keys.append(f"{base}/gmail/{msg_id}.eml")
+
+        # Calendar: _index.json has [event_id, ...] → calendar/events/{id}.json
+        cal_idx = src.download_json(f"{base}/calendar/_index.json")
+        if cal_idx:
+            keys.append(f"{base}/calendar/_index.json")
+            for event_id in cal_idx:
+                if isinstance(event_id, str):
+                    keys.append(f"{base}/calendar/events/{event_id}.json")
+
+        # Drive: just the index (binary files are not masked)
+        drive_idx = src.download_json(f"{base}/drive/_index.json")
+        if drive_idx is not None:
+            keys.append(f"{base}/drive/_index.json")
+
+        return keys
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         if key.endswith(".eml"):
