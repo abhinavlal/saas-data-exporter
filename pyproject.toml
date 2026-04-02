@@ -39,6 +39,10 @@ ner = [
 validate = [
     "anthropic>=0.40",
 ]
+images = [
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["lib", "exporters", "scripts"]
