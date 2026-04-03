@@ -3,6 +3,7 @@
 import logging
 
 from lib.s3 import S3Store
+from scripts.pii_mask.documents import is_office_doc
 from scripts.pii_mask.maskers.base import BaseMasker
 
 log = logging.getLogger(__name__)
@@ -12,10 +13,15 @@ class ConfluenceMasker(BaseMasker):
     prefix = "confluence/"
 
     def should_process(self, key: str) -> bool:
-        return super().should_process(key) and "/attachments/" not in key
+        if "/attachments/" in key:
+            return is_office_doc(key)
+        return super().should_process(key)
 
     def list_keys(self, src: S3Store) -> list[str]:
-        """Enumerate files from pages/_index.json per space."""
+        """Enumerate files from pages/_index.json per space.
+
+        Also discovers Office document attachments via S3 listing.
+        """
         keys = []
         spaces = self._list_entities(src)
         for space in spaces:
@@ -27,11 +33,20 @@ class ConfluenceMasker(BaseMasker):
             for page_id in idx:
                 if isinstance(page_id, str):
                     keys.append(f"{base}/pages/{page_id}.json")
+
+            # Enumerate Office doc attachments
+            att_keys = src.list_keys(
+                f"{self.prefix}{space}/attachments/")
+            keys.extend(k for k in att_keys if is_office_doc(k))
+
         log.info("confluence: %d files across %d spaces",
                  len(keys), len(spaces))
         return keys
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
+        if key.endswith((".docx", ".xlsx", ".pptx")):
+            return self._mask_document_file(src, dst, key)
+
         data = src.download_json(key)
         if data is None:
             return "skipped (not found)"

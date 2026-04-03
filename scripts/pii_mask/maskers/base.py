@@ -2,10 +2,20 @@
 
 import logging
 
-from scripts.pii_mask.scanner import TextScanner
 from lib.s3 import S3Store
+from scripts.pii_mask.scanner import TextScanner
 
 log = logging.getLogger(__name__)
+
+# Content types for Office XML formats
+_OFFICE_CONTENT_TYPES = {
+    "docx": "application/vnd.openxmlformats-officedocument"
+            ".wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument"
+            ".presentationml.presentation",
+}
 
 
 class BaseMasker:
@@ -71,7 +81,9 @@ class BaseMasker:
         filename = key.rsplit("/", 1)[-1]
         if filename in self._SKIP_FILENAMES:
             return False
-        return key.endswith(".json") or key.endswith(".eml")
+        return (key.endswith(".json") or key.endswith(".eml")
+                or key.endswith(".docx") or key.endswith(".xlsx")
+                or key.endswith(".pptx"))
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         """Download, mask, and upload one file. Returns status string."""
@@ -80,6 +92,33 @@ class BaseMasker:
     def rewrite_key(self, key: str) -> str:
         """Rewrite S3 key for destination bucket."""
         return self.scanner.scan_url(key)
+
+    def _mask_document_file(self, src: S3Store, dst: S3Store,
+                           key: str) -> str:
+        """Download, mask, and re-upload an Office document."""
+        from scripts.pii_mask.documents import mask_docx, mask_xlsx, mask_pptx
+
+        raw_bytes = src.download_bytes(key)
+        if raw_bytes is None:
+            return "skipped (not found)"
+
+        ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+        mask_fn = {"docx": mask_docx, "xlsx": mask_xlsx,
+                   "pptx": mask_pptx}.get(ext)
+        if mask_fn is None:
+            return "skipped (unsupported ext)"
+
+        try:
+            masked_bytes = mask_fn(raw_bytes, self.scanner)
+        except Exception:
+            log.error("Failed to mask document %s", key, exc_info=True)
+            return "error (document masking failed)"
+
+        dst_key = self.rewrite_key(key)
+        dst.upload_bytes(masked_bytes, dst_key,
+                         content_type=_OFFICE_CONTENT_TYPES.get(ext,
+                             "application/octet-stream"))
+        return "ok"
 
     def _scan_obj(self, obj):
         """Recursively run scanner.scan() on every string value.

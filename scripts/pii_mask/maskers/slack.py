@@ -3,6 +3,7 @@
 import logging
 
 from lib.s3 import S3Store
+from scripts.pii_mask.documents import is_office_doc
 from scripts.pii_mask.maskers.base import BaseMasker
 
 log = logging.getLogger(__name__)
@@ -12,10 +13,15 @@ class SlackMasker(BaseMasker):
     prefix = "slack/"
 
     def should_process(self, key: str) -> bool:
-        return super().should_process(key) and "/attachments/" not in key
+        if "/attachments/" in key:
+            return is_office_doc(key)
+        return super().should_process(key)
 
     def list_keys(self, src: S3Store) -> list[str]:
-        """Enumerate files from messages/_index.json per channel."""
+        """Enumerate files from messages/_index.json per channel.
+
+        Also discovers Office document attachments via S3 listing.
+        """
         keys = []
         channels = self._list_entities(src)
         for channel in channels:
@@ -27,11 +33,19 @@ class SlackMasker(BaseMasker):
                 for ts in idx:
                     if isinstance(ts, str):
                         keys.append(f"{base}/messages/{ts}.json")
+
+            # Enumerate Office doc attachments
+            att_keys = src.list_keys(f"{self.prefix}{channel}/attachments/")
+            keys.extend(k for k in att_keys if is_office_doc(k))
+
         log.info("slack: %d files across %d channels",
                  len(keys), len(channels))
         return keys
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
+        if key.endswith((".docx", ".xlsx", ".pptx")):
+            return self._mask_document_file(src, dst, key)
+
         data = src.download_json(key)
         if data is None:
             return "skipped (not found)"

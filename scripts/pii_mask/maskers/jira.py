@@ -3,6 +3,7 @@
 import logging
 
 from lib.s3 import S3Store
+from scripts.pii_mask.documents import is_office_doc
 from scripts.pii_mask.maskers.base import BaseMasker
 
 log = logging.getLogger(__name__)
@@ -12,10 +13,15 @@ class JiraMasker(BaseMasker):
     prefix = "jira/"
 
     def should_process(self, key: str) -> bool:
-        return super().should_process(key) and "/attachments/" not in key
+        if "/attachments/" in key:
+            return is_office_doc(key)
+        return super().should_process(key)
 
     def list_keys(self, src: S3Store) -> list[str]:
-        """Enumerate files from tickets/_index.json per project."""
+        """Enumerate files from tickets/_index.json per project.
+
+        Also discovers Office document attachments from ticket metadata.
+        """
         keys = []
         projects = self._list_entities(src)
         for i, project in enumerate(projects, 1):
@@ -26,6 +32,19 @@ class JiraMasker(BaseMasker):
             keys.append(f"{base}/tickets/_index.json")
             for ticket_key in idx.get("keys", []):
                 keys.append(f"{base}/tickets/{ticket_key}.json")
+
+                # Enumerate Office doc attachments from ticket metadata
+                ticket = src.download_json(
+                    f"{base}/tickets/{ticket_key}.json")
+                if ticket:
+                    for att in ticket.get("attachments", []):
+                        fname = att.get("filename", "")
+                        if is_office_doc(fname):
+                            from lib.s3 import sanitize_filename
+                            keys.append(
+                                f"{base}/attachments/{ticket_key}/"
+                                f"{sanitize_filename(fname)}")
+
             if i % 10 == 0:
                 log.info("jira: enumerated %d/%d projects (%d files)",
                          i, len(projects), len(keys))
@@ -33,6 +52,9 @@ class JiraMasker(BaseMasker):
         return keys
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
+        if key.endswith((".docx", ".xlsx", ".pptx")):
+            return self._mask_document_file(src, dst, key)
+
         data = src.download_json(key)
         if data is None:
             return "skipped (not found)"

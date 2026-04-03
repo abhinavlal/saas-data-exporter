@@ -1,11 +1,13 @@
 """Google Workspace masker — Presidio-first PII replacement.
 
-Handles calendar events, drive file metadata, Gmail index, and EML files.
+Handles calendar events, drive file metadata, Gmail index, EML files,
+and Office documents (Drive exports + Gmail attachments).
 """
 
 import logging
 
 from lib.s3 import S3Store
+from scripts.pii_mask.documents import is_office_doc
 from scripts.pii_mask.eml import mask_eml
 from scripts.pii_mask.maskers.base import BaseMasker
 
@@ -57,6 +59,15 @@ class GoogleMasker(BaseMasker):
                 if msg_id:
                     keys.append(f"{base}/gmail/{msg_id}.eml")
 
+            # Gmail attachments: list Office docs per message
+            for entry in gmail_idx:
+                msg_id = entry.get("id") if isinstance(entry, dict) else None
+                if not msg_id:
+                    continue
+                att_keys = src.list_keys(
+                    f"{base}/gmail/attachments/{msg_id}/")
+                keys.extend(k for k in att_keys if is_office_doc(k))
+
         # Calendar: _index.json has [event_id, ...] → calendar/events/{id}.json
         cal_idx = src.download_json(f"{base}/calendar/_index.json")
         if cal_idx:
@@ -65,16 +76,35 @@ class GoogleMasker(BaseMasker):
                 if isinstance(event_id, str):
                     keys.append(f"{base}/calendar/events/{event_id}.json")
 
-        # Drive: just the index (binary files are not masked)
+        # Drive: index + Office doc files
         drive_idx = src.download_json(f"{base}/drive/_index.json")
         if drive_idx is not None:
             keys.append(f"{base}/drive/_index.json")
+            if isinstance(drive_idx, list):
+                for entry in drive_idx:
+                    if not isinstance(entry, dict):
+                        continue
+                    if not entry.get("downloaded"):
+                        continue
+                    file_id = entry.get("id", "")
+                    name = entry.get("name", "")
+                    if not file_id or not name:
+                        continue
+                    # Reconstruct S3 key: {base}/drive/{id}_{sanitized_name}
+                    # The exporter appends extensions for Google-native docs
+                    # so name already has .docx/.xlsx/.pptx if applicable.
+                    from lib.s3 import sanitize_filename
+                    s3_name = f"{file_id}_{sanitize_filename(name)}"
+                    if is_office_doc(s3_name):
+                        keys.append(f"{base}/drive/{s3_name}")
 
         return keys
 
     def mask_file(self, src: S3Store, dst: S3Store, key: str) -> str:
         if key.endswith(".eml"):
             return self._mask_eml_file(src, dst, key)
+        if key.endswith((".docx", ".xlsx", ".pptx")):
+            return self._mask_document_file(src, dst, key)
         return self._mask_json_file(src, dst, key)
 
     def rewrite_key(self, key: str) -> str:
